@@ -1,172 +1,190 @@
 # AssemblyAI platform capabilities for a cascading voice agent
 
-Date: 2026-10-31
-Scope: what AssemblyAI's stack can do for a self-hosted STT -> LLM -> TTS agent that has tool access to its own container's file system. Sources are AssemblyAI's own docs/blogs (reached via search snippets), AssemblyAI's public GitHub repos and SDK READMEs (read directly), and third-party launch coverage. Figures are vendor-reported unless noted.
+Date: 2026-11-01 (revised; replaces the 2026-10-31 version, which is in git history)
+Scope: what AssemblyAI's stack can do for a self-hosted STT -> LLM -> TTS agent with tool access to its own container's file system.
 
-Access note: `assemblyai.com` and `docs.livekit.io` / `docs.pipecat.ai` are blocked by this cloud session's network policy, so docs pages were read through search snippets and the GitHub mirrors of the SDKs and reference agents. The four dashboard links require a login and could not be visited. Anything marked "(unverified)" could not be confirmed against the primary page.
+Access note: this revision read AssemblyAI's documentation directly, through its per-section full-text files (`/docs/llms-full/*.txt`), the Voice Agent API pages, and two first-party machine-readable references: `assemblyai.com/llms/models.md` and `assemblyai.com/pricing.md` (both updated 2026-10-27). The October 31 version only had search snippets. The five dashboard links were visited while signed in (section 2.6). Figures are vendor-reported unless noted.
 
 ---
 
 ## 1. Executive summary
 
-AssemblyAI now sells every stage of a voice agent under one API key:
-
-| Stage | Product | Interface | Price (listed) |
+| Stage | Product | Interface | Listed price |
 |---|---|---|---|
-| Ears | Universal-3.6 Pro Realtime (streaming STT, built-in end-of-turn) | WebSocket (`streaming.v3`) | $0.45/hr |
-| Ears, short-form | Sync STT (clips <= 120 s, one HTTP call) | HTTP POST | n/a in sources |
-| Ears + cleanup | Dictation API (STT + LLM rewrite in one call) | HTTP POST (multipart, chunked upload) | $0.62/hr incl. rewrite |
-| Brain | LLM Gateway (OpenAI-compatible, ~33-50 models: Claude, GPT, Gemini, Qwen, Gemma) | `POST /v1/chat/completions` | per-model |
-| Voice | AssemblyAI-TTS-1 (GA 27 Oct 2026) | HTTP, WebSocket, OpenAI-compatible | $15 / 1M chars |
-| All-in-one | Voice Agent API (STT + LLM + TTS + turn-taking + tools behind one socket) | WebSocket `wss://agents.assemblyai.com/v1/ws` | $4.50/hr flat |
+| Ears | Universal-3.6 Pro Realtime (streaming STT with built-in turn detection) | WebSocket `wss://streaming.assemblyai.com/v3/ws` | $0.45/hr of open session |
+| Ears, short clips | Sync STT (one HTTP call per clip) | HTTP | not checked |
+| Ears plus cleanup | Dictation API (STT and LLM rewrite in one call) | HTTP multipart | not on the current pricing page ($0.62/hr in launch coverage) |
+| Brain | LLM Gateway (OpenAI-compatible, about 50 models) | `POST /v1/chat/completions` | per token, per model |
+| Voice | AssemblyAI-TTS-1 (launched 2026-10-27) | WebSocket, HTTP, OpenAI-compatible route | $15 per 1M input characters |
+| All-in-one | Voice Agent API | WebSocket `wss://agents.assemblyai.com/v1/ws` | **being retired**; no longer on the pricing page |
 
-Two ways to build the agent you described:
+What changed since the October 31 report:
 
-1. **Cascading / chained (full control).** Streaming STT -> your own agent loop (LLM Gateway or any LLM) -> TTS WebSocket. You own the tool loop, so file-system tools are ordinary function calls in your process. AssemblyAI ships reference implementations of exactly this for both Pipecat and LiveKit.
-2. **Voice Agent API (least code).** One WebSocket; AssemblyAI runs STT/LLM/TTS server-side and emits `tool.call` events. You run the tool (e.g. read a file in your container) and send `tool.result`. This still gives your agent file-system access through client-side tools, but the LLM and orchestration are AssemblyAI's.
+1. **The Voice Agent API is being retired, and it does not use AssemblyAI-TTS-1.** Both first-party reference files say so in plain words: don't recommend it for new builds, use Universal-3.6 Pro Realtime plus LLM Gateway plus the TTS API instead, starting from the LiveKit or Pipecat reference agents. The Voice Agent API docs pages are still online and show no retirement notice or date, but the dashboard has already moved on: its Voice Agents section only offers the LiveKit and Pipecat reference agents, and the old Voice Agent playground URL redirects there. For a project whose point is to test the new TTS model, the chained build is the only option that exercises it.
+2. **TTS has no markup for emotion or pauses.** Tone comes from the text itself: punctuation, capitalised words, written fillers, stutters and false starts. SSML, emotion tags, speed and volume control, custom pronunciation dictionaries and non-verbal sounds are listed as not available at launch, with no dates.
+3. **Streaming STT takes the agent's replies as context** through a documented `agent_context` parameter, and carries the last five finalised user turns automatically.
+4. **Dictation** covers 32 languages (not 19), and has a second endpoint for finished recordings up to 20 minutes. Its rewrite step can take a full LLM Gateway request instead of a plain-English instruction.
+5. **Free start:** $50 of credits at signup with no credit card. The free tier allows 5 new streaming sessions per minute (100 on pay-as-you-go), and TTS sessions share that limit.
 
-For "explore the full AssemblyAI stack" the chained route exercises more of the products (STT, LLM Gateway, TTS, Dictation as an optional input mode). The Voice Agent API is worth a second, smaller experiment.
+The build that fits your goal is a cascade you orchestrate yourself: streaming STT, then your own agent loop calling LLM Gateway with file-system tools, then the TTS WebSocket. AssemblyAI ships that exact cascade as two MIT-licensed reference agents, one on Pipecat and one on LiveKit.
 
 ---
 
-## 2. Product-by-product detail
+## 2. Product by product
 
 ### 2.1 Streaming speech-to-text: Universal-3.6 Pro Realtime
 
-- Recommended streaming model; 32 languages; keyterms prompting (up to 100 terms); native free-text `prompt` for context, updatable mid-session.
-- **End-of-turn detection is built in** and entity-aware: it holds the turn open while the user is mid-number, email, address or code. Each turn carries a 0-1 end-of-turn confidence you can threshold. Reported precision 77.9% (up from 74.1% on 3.5 Pro), recall ~92-93%.
-- Turn controls exposed in integrations: `min_turn_silence` (speculative check), `max_turn_silence` (forced end), turn-detection profiles (`balanced` is the reference default), speech threshold (0.2 default), optional server-side noise suppression ("voice focus").
-- Latency claims vary by what is measured: ~150 ms P50 on the product page, 537 ms median end-of-turn latency in the 3.6 blog, 307 ms median time-to-final in a Vapi/Pipecat measurement. Treat "sub-300 ms partials, ~0.5 s to final" as the realistic planning number.
-- **Conversation/agent context (Universal-3.5 Pro Realtime onward):** the streaming model can take the agent's last question as input so it recognises likely answers (dates, yes/no, names). This is directly useful to a cascading agent: feed the TTS text you just spoke back into the STT session as context.
-- `llm_gateway` parameter on the streaming session: run an LLM Gateway prompt on each final turn server-side (documented for summaries/action items, but the prompt is free-form, so it can be a cleanup prompt).
-- SDK: `RealTimeTranscriber` / `AsyncRealTimeTranscriber` (`assemblyai.streaming.v3`), events `Begin`, `Turn`, `Termination`, `Error`; `force_endpoint()` to end a turn manually; `ChannelStreamer` to mix mic + system audio; `create_temporary_token()` for browser clients. Model id strings in the wild: `universal-3-6-pro`, `u3-rt-pro`, `universal-3-5-pro` (check the current docs before hardcoding).
+- Default and recommended streaming model (`speech_model=universal-3-6-pro`). 32 languages with native code-switching, language detection, and disfluencies kept in the transcript. Universal-3.5 Pro is still supported with 18 languages. The cheaper Universal-Streaming English and Multilingual models ($0.15/hr) lack prompting and conversation context.
+- **Turn detection is built in** and entity-aware: it holds the turn open while the user is mid-number, mid-email or mid-address. Turn settings can be changed per question, for example loosened while capturing an entity and restored afterwards.
+- **Prompting:** keyterms (up to 100, included in the price) for known vocabulary, plus a free-text `prompt` (beta, +$0.05/hr) describing the situation. Both can be replaced mid-session with an `UpdateConfiguration` message.
+- **Conversation context:** pass what your TTS just said as `agent_context`, at connect time for the greeting and with `UpdateConfiguration` after every reply. The model then expects the right kind of answer, so "user at assemblyai dot com" comes back as an email address. Prior finalised user turns are carried forward automatically: 5 entries, 1,750 characters at most, per session only.
+- Add-ons on 3.6 Pro: Voice Focus noise suppression (+$0.10/hr), diarization (+$0.12/hr), medical mode (+$0.15/hr). Real-time translation, PII redaction and profanity filtering are documented too.
+- Billing is per second of **open WebSocket**, not audio sent, so idle sessions cost money.
+- Data zones: an edge endpoint that routes to the nearest region, plus pinned US and EU endpoints. Temporary tokens let a browser connect without your API key.
+- The docs have a guide for applying an LLM Gateway prompt to each final turn, which is one way to bolt cleanup onto streaming.
 
-### 2.2 Sync STT (short clips)
+### 2.2 Dictation API (STT plus LLM cleanup in one call)
 
-- `aai.SyncTranscriber`: WAV or raw PCM, <= 120 s and <= 40 MB, one request, one response. Used by the CLI's `assembly dictate` before the Dictation API existed. Good for push-to-talk input where you do not need partials.
+- Two endpoints. `transcribe/live` accepts audio while the person is still talking (up to 120 s) and returns one finished result when the upload closes. `transcribe` takes a finished recording up to 20 minutes. Neither returns partials.
+- Runs on Universal-3.5 Pro across 32 languages. A connection pre-warming guide covers opening the HTTPS connection before the user starts speaking.
+- Request fields: `language_codes`, `stt_prompt` (situation description), `keyterms_prompt` (exact terms), `llm_instruction` (plain-English rewrite task that replaces the default cleanup), `rewrite_mode` (`fast` by default, or `smart` for better adherence to formatting instructions at higher latency). For full control, send `llm` instead of `llm_instruction`: a complete LLM Gateway chat-completions request or a saved prompt.
+- Default cleanup removes fillers, resolves self-corrections to what the speaker settled on, and fixes punctuation and capitalisation while keeping the speaker's phrasing. The docs' own example turns "move the the meeting to thursday i think friday works better actually" into "Can we move the meeting to Friday? That works better."
+- Response carries both the verbatim `text` and the rewrite.
+- AssemblyAI's open-source macOS app **Blurt** (github.com/AssemblyAI/blurt) is a Wispr-Flow-style client on this API and the best public reference for context-aware dictation cleanup.
 
-### 2.3 Dictation API (STT + LLM cleanup in one call)
+### 2.3 LLM Gateway
 
-- Endpoint `POST https://dictation.assemblyai.com/v1/transcribe/live`, multipart with the config part first; audio is uploaded while the person is still speaking and one finished result is returned when the stream closes. It is **not** a streaming-output API: no partials, one answer per utterance.
-- Built on Universal-3.5 Pro (3.6 per newer pages); 19 languages per docs (pricing page says 32, likely stale); <= 120 s per request. Launched ~20 Sept 2026. $0.62/hr including the LLM rewrite. Launch coverage quotes ~134 ms median added latency for the rewrite (third-party, unverified).
-- Request fields: `language_codes`, `stt_prompt` (<= 6,000 chars, describes the situation), `keyterms_prompt` (<= 100 terms / 8,000 chars), `llm_instruction` (<= 2,048 chars; **replaces** the default cleanup, so specify everything you want), `rewrite_mode` = `fast` (default) or `smart` (better formatting adherence, higher latency), `sample_rate` + `channels` for raw PCM.
-- Response: `text` (verbatim), `llm_response` (rewrite or null), `llm_error`, `final_text`, `session_id`.
-- Default cleanup resolves self-corrections ("Tuesday, no, Wednesday" -> "Wednesday"), removes fillers, fixes punctuation, honours spoken commands like "new paragraph".
-- AssemblyAI's own open-source macOS app **Blurt** (github.com/AssemblyAI/blurt, Swift) is a Wispr-Flow-style client on this API. It sends, per request: the last ~100 dictations of the session (<= ~4,096 chars), a short run of text before the cursor (never from password fields), key terms and a user-chosen style instruction. It does **not** send app name, window title or selection. It pre-warms the HTTPS connection on key-down and reports ~1 s typical end-to-end. This is the closest public reference for "context-aware dictation cleanup" and is relevant to the Wispr Flow research.
-- CLI: `assembly dictate` (signal-driven, prints cleaned text on SIGTERM).
+- OpenAI-compatible `https://llm-gateway.assemblyai.com/v1/chat/completions` with US, EU and global routing. Global routing is the listed price; pinning a region costs 10% more.
+- About 50 models from Anthropic, OpenAI, Google and Qwen. Pricing examples per 1M tokens (input / output): Claude 4.6 Sonnet $3 / $15, Claude 4.5 Haiku $1 / $5, GPT-5-Mini $0.25 / $2, Gemini 2.5 Flash $0.30 / $2.50. The docs' own examples default to `claude-sonnet-4-6`; the reference agents default to `gemma-4-31b`.
+- Features that matter for this agent: tool calling in OpenAI shape for every provider (note that `finish_reason` stays provider-native: `tool_use` for Claude, `tool_calls` for OpenAI), a documented agentic loop that you run client-side, a `json-repair` post-processing step for malformed tool arguments, structured outputs, model fallbacks, prompt caching on Anthropic, OpenAI and Google models, and saved prompts.
+- The gateway does not run your tools. Your process executes each tool call and sends the result back, which is what you want for file-system access.
 
-### 2.4 LLM Gateway
+### 2.4 Text-to-speech: AssemblyAI-TTS-1
 
-- OpenAI-compatible: `https://llm-gateway.assemblyai.com/v1/chat/completions` (EU: `llm-gateway.eu.assemblyai.com`). Works with the OpenAI SDK by swapping `base_url`. Streaming supported; `fallback_config` for model fallbacks; automatic retry on 5xx.
-- Model catalogue: docs say 25+, the live pricing page lists 33 (9 Anthropic, 12 OpenAI, 9 Google, 3 Qwen), reference agents say ~50 and default to `gemma-4-31b`. Example ids seen: `claude-sonnet-4-6`, `claude-sonnet-5`, `gpt-5.2`. OpenAI models are US-only; Claude and Gemini are available in the EU.
-- Tool calling is supported (the reference agents use it for `get_current_time`). This is where a file-system tool set plugs in.
-- SDK: `aai.LLMGateway` with `models.list()`, `chat.completions.create()` (streaming), and `understanding.create()` for speech-understanding over a transcript.
-- Open-source companion: `voice-standard-bench` (Go) benchmarks gateway LLMs on summarisation, extraction, text correction and dictation command handling, with TTFT and cost-per-quality. Useful for picking the cleanup/brain model.
+**Positioning.** Conversational speech for voice agents, mostly phone agents. AssemblyAI says outright that it is not built for voiceover, audiobooks or long-form audio. Time to first audio is "about 90 ms", which AssemblyAI calls an estimate.
 
-### 2.5 Text-to-speech: AssemblyAI-TTS-1
+**Voices and languages.**
+- Six languages: English, Spanish, French, German, Italian, Portuguese. Every voice can speak all six once you set `language`, but a voice sounds best in the language it was recorded in, and text in a language other than the session's comes out mispronounced. The API does not detect language. `language` takes full names such as `spanish`, unlike the STT APIs, which take codes.
+- 4,000+ catalog voices with `aai-` slugs (examples: `aai-audrey`, `aai-sara`, `aai-titus`, `aai-constanza` for Mexican Spanish). Eleven built-in voices are always loaded (`aai-jane` is the default); other voices load on first use, so the first session with a cold voice waits slightly longer. The old `voice=` parameter is retired; use `voice_id`.
+- Instant voice cloning in the dashboard from about 25 seconds of a consenting speaker (the playground version asks you to read two short sentences), with a consent period you renew and a biometric data addendum. A cloned voice only works in the data zone where it was created. Cloned voices cost the same as library voices. The sources disagree on languages: the docs say a clone can speak all six when `language` is set, while the dashboard quickstart says a clone speaks only the language it was recorded in. Test before relying on either.
 
-- GA announced 27 Oct 2026 (this is the "new TTS model"). Positioned for voice agents: ~90 ms time-to-first-audio on the pricing page, 47 ms median TTFB in AssemblyAI's own cross-vendor benchmark. $15 per 1M characters, no per-voice, concurrency or minimum fees; "unlimited concurrency without an annual contract" (vendor claim).
-- Languages: English, Spanish, French, German, Italian, Portuguese; every voice speaks all six, so one voice can switch language mid-conversation. More languages "in coming weeks".
-- Voices: 4,000+ library voices (per AssemblyAI's reference-agent READMEs) plus instant voice cloning from an uploaded recording, managed in the dashboard voice catalog. Slugs look like `aai-jane`, `aai-sara`, `aai-alba`, `aai-michael`; defaults in the reference agents are "Keegan" (LiveKit) and "Audrey" (Pipecat). Cloned voices carry a biometric-consent flag (`extend_biometric_consent`) and an expiry.
-- Three interfaces:
-  - HTTP `POST https://tts.us.assemblyai.com/v1/speech` (one-shot; `synthesize()` for full audio or `stream()` for chunks; mp3 available here only).
-  - WebSocket `wss://tts.us.assemblyai.com/v1/ws?voice_id=...&sample_rate=24000&encoding=pcm_s16le` for live conversations: one session per conversation, one request per turn. Frames: `Begin`, `Generate` (send text, <= 2,000 chars/frame), `Flush`, `Cancel` (barge-in: drops queued text), `KeepAlive`, `Terminate`; server sends audio, `FlushDone`, optional `WordBoundaries`, `Error`. Limits: ~100 chars/s intake after a 1,500-char burst, <= 8,000 unspoken chars buffered, 1-hour session max, 5-120 s inactivity timeout. Only PCM s16le / mu-law / a-law over the socket.
-  - OpenAI-compatible route `https://tts.us.assemblyai.com/v1/openai` (drop-in for code written against OpenAI's speech endpoint).
-- Audio: native 24 kHz; also 8k/16k/22.05k/44.1k/48k (resampled); encodings pcm_s16le, pcm_mulaw, pcm_alaw, mp3 (HTTP only); container raw or wav.
-- **Word boundaries** (`word_boundaries=true`) give per-word timings per request, which the reference agents use so that on interruption the chat history only records what the user actually heard. Important for a correct barge-in implementation.
-- EU residency: `tts.eu.assemblyai.com`.
-- SDKs: Python `aai.TextToSpeech` / `aai.TTSSession` (`speak`, `generate`, `flush`, `cancel`), `aai.TTSConfig`; Node `client.tts.synthesize/stream/session`, `createTemporaryToken()` for browsers. LiveKit (`livekit-plugins-assemblyai`) and Pipecat (`pipecat-ai[assemblyai]`, plus a portable `assemblyai_tts.py` in the reference repo) have native TTS plugins.
-- Dashboard: a Text-to-Speech playground (pick voice, type text, listen) and the voice catalog / cloning UI live there (the TTS and `get-started?product=tts` links you gave).
-- CLI: `assembly speak` (auto-assigns voices per `Speaker A:` label), `assembly dub`.
+**Controlling delivery with text.** No SSML, tags or speed control. Instead:
+- `!` for emphasis, `?` for question intonation, `?!` for surprise.
+- Commas or ellipses for short pauses; stacking them does not lengthen the pause.
+- A trailing `--` for a sudden cutoff.
+- ALL CAPS on a word to stress it.
+- Written fillers ("It's, uh, right here"), stutters ("I c-c-can't"), false starts ("That- that is the one").
+- Brackets are read aloud, so `[pause]` or `[laughs]` is spoken as a word. Strip such tags from LLM output.
+- The server normalises currencies, dates with years, phone numbers, addresses, units, emails and URLs, and drops emoji and Markdown. File paths and hex numbers are read symbol by symbol, which matters for an agent that talks about files.
+- The prompting guide recommends having the LLM write like a person on a call: soft openings ("Yeah, so..."), one small stumble per reply, short first turns, no internal abbreviations.
 
-### 2.6 Voice Agent API (unified speech-to-speech)
+**Interfaces.**
+- WebSocket `wss://tts.us.assemblyai.com/v1/ws` (EU: `tts.eu.assemblyai.com`): one session per conversation. Frames: `Generate` (text, up to 2,000 characters), `Flush`, `Cancel` for barge-in, `KeepAlive`, `Terminate`; the server sends `Begin`, audio, `FlushDone`, optional `WordBoundaries`, `Error`.
+- HTTP `POST /v1/speech`: up to 5,000 characters, streamed or buffered, with a `Server-Timing` header that reports server-side time to first audio. A server-sent-events variant returns word timings.
+- OpenAI-compatible route, so OpenAI SDK code works with a new base URL.
+- Native output is 24 kHz 16-bit PCM; other rates and mu-law / a-law are converted server-side. MP3 adds about 46 ms of encoder silence at 24 kHz, so use PCM for an agent.
+- Native plugins for LiveKit (`assemblyai.TTS`) and Pipecat (`AssemblyAITTSService`), and Python and JavaScript SDKs.
 
-- Launched 30 Apr 2026. One WebSocket (`wss://agents.assemblyai.com/v1/ws`), audio in / audio out, with STT (Universal-3.x Pro Realtime), a managed LLM, TTS, turn detection, barge-in, noise suppression and tool calling handled server-side. Audio is PCM16 mono 24 kHz, base64 in `input.audio`. $4.50/hr ($0.075/min) per second of open session, covering STT + managed LLM + TTS + hosting.
-- Configure inline via `session.update` (first message; `system_prompt` is mutable mid-session; voice/output format are immutable after `session.ready`) or bind a stored agent by `agent_id`. Stored agents: `POST/PUT/GET /v1/agents` (name, system prompt, voice required). Always send `session.end`; closing the socket leaves the session resumable and billable for 30 s.
-- Events: 4 client -> server (`session.update`, `input.audio`, `tool.result`, `session.end` / `session.resume` depending on page) and 12 server -> client, including `session.ready`, `session.updated`, `input.speech.started/stopped`, `transcript.user.delta`, `transcript.user`, `reply.started`, `reply.audio`, `transcript.agent` (now word-by-word per changelog), `reply.done` (status `interrupted` on barge-in), `tool.call`, `session.ended`. Tool results carry an `is_error` flag (recent changelog).
-- **Tools:** two kinds, same JSON-Schema `parameters`, `description`, `execution_mode`, `timeout_seconds`.
-  - *Client-side tools*: agent emits `tool.call {call_id, name, arguments}`; you run it and reply `tool.result {call_id, result:<JSON string>}`, recommended from the `reply.done` handler. **This is how a Voice-Agent-API build would get file-system access to your container.**
-  - *HTTP tools*: AssemblyAI calls your HTTP endpoint directly; header values and `llm[].api_key` are write-only.
-- **Bring your own LLM:** set the agent's `llm` field to any OpenAI-compatible `/chat/completions` endpoint (your own, or point `base_url` at LLM Gateway to choose Claude/GPT/Gemini). Latency then depends on your endpoint; Gateway usage is billed separately.
-- Telephony: Twilio SIP trunk example (`voice-agent-api-twilio-example`), jambonz and Agora integrations; LiveKit blog shows multi-user browser rooms bridged to the API.
-- Testing: Cekura integration for simulated phone calls. Starter repos (`voice-agent-starter-python/js`, stdlib only) define an agent as one JSON file, publish it, serve a browser test page that mints session tokens, and attach a Twilio number. The dashboard `agent` tab you linked is where stored agents are listed/created (inferred from the manage-agents docs; not visited).
-- Migration guides exist from OpenAI Realtime API.
+**Latency rules from the docs.**
+- Open the TTS session when the call starts, not when the first reply is ready.
+- Forward LLM tokens as they arrive, with their spaces, and send `Flush` at the end of every sentence. Without a flush, a short first sentence waits for the next one: the server ignores sentence ends in roughly the first 50 characters. Never flush per token; that breaks prosody and trips the control-frame limit.
+- Keep the first sentence short.
+- Run the agent in the same data zone as STT and TTS (`tts.us` is us-east-1, `tts.eu` is eu-north-1).
 
-### 2.7 Dashboard pages you linked (not visited; inferred)
+**Limits.** Session up to 1 hour; 120 s idle timeout (configurable down to 5 s); about 100 characters per second of sustained text intake after a 1,500-character burst; 8,000 characters of unspoken backlog; 20 control frames per second.
 
-| Link | What it most likely is |
+**Word boundaries** give per-word timings. On barge-in, the reference agents cut the chat history at the last word the user actually heard.
+
+### 2.5 Voice Agent API (being retired)
+
+Still documented and usable, but AssemblyAI's own references say not to start new builds on it, and it does not run AssemblyAI-TTS-1. For the record, it offers:
+- One WebSocket carrying audio both ways, with STT, a managed LLM, TTS, turn detection and barge-in on AssemblyAI's side. Reusable agents are stored with `POST /v1/agents` (name, system prompt, voice, greeting, tools, optional `llm`).
+- **Two tool types:** HTTP tools, which AssemblyAI calls for you, and function tools, which arrive as `tool.call` events for your code to answer with `tool.result` after `reply.done`. Function tools are how this API would reach your container's file system. Tool parameters use JSON Schema, and `enum`, `pattern`, `examples` and `format` also inform turn detection, so the agent waits for a complete phone number before replying. Execution modes are `interactive` (keeps talking, "let me check") and `hold` (goes quiet, for slow operations).
+- Bring your own OpenAI-compatible LLM, or point it at LLM Gateway.
+- Session history with downloadable recordings and JSON timelines, Twilio SIP phone numbers, DTMF capture for card entry, and simulated-caller testing with Bluejay and Cekura.
+- Closing the socket without `session.end` keeps the session resumable, and billable, for 30 seconds.
+
+The design ideas here (schema-aware turn detection, interactive versus hold tools, history cut at the heard word) are worth copying into a chained build.
+
+### 2.6 Dashboard pages you linked (visited 2026-11-01, signed in)
+
+| Link | What it actually is |
 |---|---|
-| `dashboard/playground/text-to-speech` | TTS playground: pick a library/cloned voice, type text, listen; voice catalog + cloning |
-| `get-started?product=tts` | TTS quickstart (API key, curl/SDK snippet, link to playground) |
-| `dashboard/agent` | Stored Voice Agent API agents (create/edit system prompt, voice, tools; test) |
-| `get-started?product=voice-agent` | Voice Agent API quickstart (starter repos, WebSocket snippet) |
-| `get-started?product=dictation` | Dictation API quickstart (`transcribe/live` snippet, Blurt/CLI links) |
+| `dashboard/playground/text-to-speech` | TTS playground. Settings: model (AssemblyAI TTS-1 only), sample rate, voice, language. Three sample scripts (appointment scheduling, billing and payments, support handoff), a 2,000-character text box, and Audio, Code and API Response tabs. The Code tab gives a ready-to-run HTTP or WebSocket request for the current voice. A "Clone a voice" panel makes a voice from two sentences you read aloud. Speed, emotion tags and pronunciation dictionary are shown as "Coming soon". |
+| `get-started?product=tts` | TTS quickstart: a three-step checklist (copy key, pick a voice, run the snippet) with cURL, Python and JavaScript versions for HTTP and WebSocket. Links to the prompting guide, voice library, cloning, the playground, per-request session logs and the biometric data addendum. |
+| `dashboard/agent` | **Not a voice agent manager.** It is an AI coding assistant ("What can I help you build with AssemblyAI?") that writes code into a side canvas, with starters such as "Turn text into speech for a voice agent" and "Build a dictation app". It shows credits used, and AssemblyAI says chat content is shared with its team, so keep sensitive details out of it. |
+| `get-started?product=voice-agent` | Quickstart for the **LiveKit and Pipecat reference agents**, not the Voice Agent API. Shows each repo's full agent file. LiveKit runs in your terminal (`uv run src/agent.py console`) or joins LiveKit Cloud rooms (`dev`). Pipecat serves a call page at `localhost:7860`, or uses a Daily room or a Twilio number. |
+| `get-started?product=dictation` | A combined Sync STT and Dictation quickstart, led by a long prompt meant for coding agents. Useful facts in it: audio from 80 ms to 20 minutes, file bytes only (no URL), no temporary-token flow (browser apps must proxy through a server), and a docs MCP server at `https://mcp.assemblyai.com/docs`. |
 
-To have me walk these page by page, either (a) allow `www.assemblyai.com` and `assemblyai.com` in this environment's Network access settings (still no login, so the public docs only), or (b) run this in the Claude desktop app where the built-in browser pane is available and you can sign in. The built-in browser is not available in this cloud session, and your computer's Remote Control folders are not offered to cloud sessions, so the session cannot be linked to it.
+Other dashboard pages seen on the way: the voice library at `dashboard/text-to-speech/voices` (filters for gender, accent, age, language and tags; Recommended, Public, My Voices and Liked tabs; community votes; "Create Voice Clone"), and a Text to Speech > Logs page. The sidebar's Voice Agents section holds only "Get Started", and `dashboard/playground/voice-agent` redirects to the reference-agent quickstart.
 
-### 2.8 Developer tooling
+Caution: the playground's Code tab and the quickstart snippets embed your real API key. Don't screenshot or paste them anywhere public.
 
-- Python SDK `assemblyai` (>=1.5): `prerecorded.v2`, `sync.v1`, `streaming.v3`, `DictationTranscriber`, `TextToSpeech`/`TTSSession`, `LLMGateway`. Node SDK with the same surface (`client.tts`, `client.dictation`, streaming).
-- CLI `assembly`: `transcribe`, `stream`, `dictate`, `speak`, `agent` (full-duplex terminal voice agent, ~20 voices, `--show-code` prints the equivalent Python), `live` (client-side cascading agent: Streaming STT + deepagents brain on LLM Gateway + streaming TTS, with web search/URL fetch), `llm`, `eval` (WER), `setup` (installs docs MCP server + coding-agent skills), `webhooks listen`, `init/dev/share/deploy`.
-- Docs MCP server and Claude Code / Cursor skills (`assembly setup`, `assemblyai-skill`, `docs/agent-instructions.md`, `llms.txt`). The `assemblyai-mcp` server covers async transcription + Speech Understanding only (not TTS/agents).
-- Reference agents (MIT): `assemblyai-pipecat-reference-voice-agent` and `assemblyai-livekit-reference-voice-agent`. Both: Universal-3.6 Pro -> LLM Gateway (`gemma-4-31b`) -> AssemblyAI TTS with word timings; one file agent (`src/bot.py` / `src/agent.py`); skills for voice, turn detection, VAD, voice focus, keyterms, languages, medical mode, LLM model, data residency, add-a-tool; Dockerfile; tests; deploy to Pipecat Cloud / LiveKit Cloud or any container host.
+### 2.7 Developer tooling
+
+- Python and Node SDKs cover streaming STT, Dictation, TTS sessions and LLM Gateway.
+- The `assembly` CLI (github.com/AssemblyAI/cli) includes dictation, TTS and terminal voice-agent commands (command list from the previous report, not re-checked).
+- An integration prompt for coding agents at `docs/agent-instructions.md`, plus `llms.txt` and per-section full-text files.
+- **Reference agents** (MIT, updated 2026-10-28): `assemblyai-pipecat-reference-voice-agent` and `assemblyai-livekit-reference-voice-agent`. Both wire Universal-3.6 Pro to LLM Gateway (`gemma-4-31b`) to AssemblyAI TTS with word timings. Defaults: `balanced` turn detection, 0.2 speech threshold, voice Audrey (Pipecat) or Keegan (LiveKit). Each building block (voice, turn detection, VAD, Voice Focus, keyterms, languages, medical mode, LLM) is a skill in `skills/`, and an `AGENTS.md` tells Claude Code or Cursor how to customise the agent.
+- `voice-standard-bench` benchmarks gateway models on voice post-processing tasks, useful for picking the brain or cleanup model.
 
 ---
 
-## 3. LiveKit vs Pipecat (brief)
+## 3. LiveKit vs Pipecat
 
-They occupy the same slot (open-source voice-agent orchestration framework) and are roughly interchangeable for a two-party STT -> LLM -> TTS agent, but they are built around different centres of gravity.
+Both are open-source frameworks for orchestrating a real-time voice agent: they move audio between the user and your STT, LLM and TTS services, handle turn-taking and interruptions, and stream everything so replies start quickly. Neither provides models. For a two-party STT -> LLM -> TTS agent they are interchangeable, and AssemblyAI ships the same reference agent on both.
 
 | | LiveKit Agents | Pipecat |
 |---|---|---|
-| Maintainer / licence | LiveKit, Apache-2.0 (turn-detector model under LiveKit Model License) | Daily, BSD-2 |
-| Core abstraction | `AgentSession` joins a WebRTC **room** on a LiveKit server (Cloud or self-hosted). Event-driven, state auto-synced to clients. | A **pipeline** of frame processors (transport -> STT -> LLM -> TTS -> transport). Static graph, you manage state/client sync. |
-| Media server | Required: LiveKit SFU. The framework assumes it. | None required. Transports: SmallWebRTC (P2P), Daily, **LiveKit**, FastAPI WebSocket, Vonage, WhatsApp, local; Twilio/Telnyx/Plivo via serializers. |
-| Languages | Python and Node | Python (JS client SDKs) |
-| Telephony | Native SIP trunking | Via Daily or serializers |
-| Multi-party / video / avatars | Strong (rooms, video tracks, avatar providers) | Fine for 2-party; multi-party is more manual |
-| Integrations | Plugin per vendor + LiveKit Inference unified layer | Largest catalogue (~24 STT, 26 LLM, 32 TTS in README) |
-| Hosting | LiveKit Cloud (`lk agent deploy`) or your container | Pipecat Cloud (`pipecat cloud deploy`) or your container |
-| AssemblyAI support | STT + TTS plugins, official reference agent | STT + TTS, official reference agent |
+| Maintainer, licence | LiveKit, Apache-2.0 | Daily, BSD-2-Clause |
+| Core idea | An agent joins a WebRTC **room** on a LiveKit media server (LiveKit Cloud or self-hosted) | A **pipeline** of frame processors: transport -> STT -> LLM -> TTS -> transport |
+| Media server | Required for real clients; a `console` mode talks to you in the terminal without one | Not required; transports include peer-to-peer WebRTC, Daily, LiveKit, plain WebSocket and telephony serializers |
+| Languages | Python and Node | Python (client SDKs in JS and others) |
+| Strengths | Browser and mobile clients, multi-party rooms, video and avatars, native SIP telephony | Explicit control of every frame, simple local loops, the widest vendor catalogue |
+| Hosting | LiveKit Cloud or your own container | Pipecat Cloud or your own container |
 
-Interchangeable? For your use case, yes: both reference agents implement the identical AssemblyAI pipeline and both expose the same knobs. Choose LiveKit if you want a browser/mobile client with zero client-side plumbing, SIP phone numbers, or more than two participants. Choose Pipecat if you want a dependency-free local loop (SmallWebRTC or plain WebSocket), the most explicit control over the frame pipeline, or to swap vendors frequently. Note the asymmetry: Pipecat can use LiveKit as a transport, but LiveKit Agents cannot run without a LiveKit server.
-
-Neither is a vendor of models; the bill is the models either way.
+Choose LiveKit if you want a polished browser or phone client and expect more than two participants. Choose Pipecat if you want the simplest local loop with no media server and fine control of the pipeline. Pipecat can use LiveKit as a transport, but LiveKit Agents needs a LiveKit server for anything beyond its terminal `console` mode.
 
 ---
 
 ## 4. Recommended architecture for the file-system agent
 
 ```
-mic/browser ──PCM──> Universal-3.6 Pro Realtime (WebSocket, built-in EOT, prompt = agent's last question)
-                       │ Turn (final) events
-                       ▼
-             agent loop (your process in the container)
-               ├─ optional: Dictation-style cleanup prompt via LLM Gateway on each final turn
-               ├─ LLM Gateway chat.completions (tools: list_dir, read_file, write_file, grep, run_cmd ...)
-               │     tool calls executed against a sandboxed root inside the container
-               └─ streams reply tokens
-                       │ sentences / tokens
-                       ▼
-             AssemblyAI-TTS-1 WebSocket session (Generate / Flush / Cancel, word_boundaries=true)
-                       │ 24 kHz PCM
-                       ▼
-                   speaker/browser  (barge-in: on input.speech.started -> TTS Cancel, truncate history to last spoken word)
+mic/browser --PCM--> Universal-3.6 Pro Realtime (WebSocket; turn detection; agent_context = last reply)
+                       | final turns
+                       v
+             agent loop (your process, inside the container)
+               |- LLM Gateway chat.completions, streaming
+               |    tools: list_dir, read_file, write_file, search, run_cmd (sandboxed root, allow-list)
+               |    you execute each tool call and append the result
+               '- streams reply tokens, stripped of Markdown and bracket tags
+                       | tokens, Flush at each sentence end
+                       v
+             AssemblyAI-TTS-1 WebSocket (one session per conversation, word_boundaries on)
+                       | 24 kHz PCM
+                       v
+                   speaker/browser
+   barge-in: user starts speaking -> TTS Cancel -> cut history at last heard word
+   after each reply: UpdateConfiguration(agent_context = what was spoken)
 ```
 
-Design notes:
-- Sandbox the tool root (e.g. `/workspace`) and allow-list commands; the LLM, not you, decides when to call them.
-- Speak the first sentence as soon as the LLM emits it; keep one TTS session for the whole conversation.
-- Feed the spoken reply text into the STT session's context/`prompt` to improve recognition of the user's answer.
-- Second experiment: the same tool set exposed as Voice Agent API client-side tools (`tool.call` -> `tool.result`) to compare latency and effort against the chained build.
-- Optional third input mode: push-to-talk through the Dictation API (`llm_instruction` tuned for commands) to compare cleaned vs verbatim transcripts as agent input.
+Notes:
+- Start from the Pipecat reference agent (no media server needed for local testing) and add the tools there; switch to the LiveKit one later if you want a hosted browser client.
+- Keep the system prompt's spoken-style rules from the TTS prompting guide, and tell the model to describe file paths in words rather than reading them out symbol by symbol.
+- Tools that take seconds (a long search or command) should say a short "let me check" first, the same idea as the Voice Agent API's interactive mode.
+- Optional experiment: a push-to-talk input mode through the Dictation API, to compare cleaned versus verbatim transcripts as agent input.
 
 ---
 
 ## 5. Sources
 
-AssemblyAI docs/blog (via search snippets): Models; Voice Agent API overview, session configuration, events reference, message sequence, tool calling, client-side tools, connect-your-own-LLM, manage agents, test with Cekura; TTS quickstart, voices, cloned voices, WebSocket API, OpenAI compatibility; Dictation API docs and launch post ("Introducing the Dictation API"), "Dictation cleanup"; LLM Gateway overview/quickstart, "Apply LLM Gateway to Streaming"; Streaming prompting guide; "Universal-3.6 Pro Realtime: your agent can take no for an answer"; "Contextual awareness in Universal-3.5 Pro Realtime"; "Introducing AssemblyAI-TTS-1" (27 Oct 2026); "How to build a voice agent with AssemblyAI: streaming STT, LLM, and TTS" (29 Oct 2026); "Build a voice agent with a chained STT-LLM-TTS architecture"; "Voice agent architectures"; Pipecat and LiveKit intro guides; pricing page; changelog.
+AssemblyAI documentation, read directly on 2026-11-01:
+- Docs index and section files: https://www.assemblyai.com/docs/llms.txt (Text to Speech parts 1 to 4, Dictation API, Real-time STT parts 1 and 2, LLM Gateway parts 1 and 2)
+- TTS: https://www.assemblyai.com/docs/tts/getting-started/quickstart, https://www.assemblyai.com/docs/tts/getting-started/optimizing-accuracy-and-latency, https://www.assemblyai.com/docs/tts/voices, https://www.assemblyai.com/docs/tts/prompting-guide, https://www.assemblyai.com/docs/tts/limits
+- Streaming STT: https://www.assemblyai.com/docs/streaming/select-the-speech-model, https://www.assemblyai.com/docs/streaming/universal-3-5-pro/context-carryover
+- Dictation: https://www.assemblyai.com/docs/dictation, https://www.assemblyai.com/docs/dictation/transcript-rewriting
+- LLM Gateway: https://www.assemblyai.com/docs/llm-gateway/tool-calling, https://www.assemblyai.com/docs/llm-gateway/agentic-workflows
+- Voice Agent API: https://www.assemblyai.com/docs/voice-agents/voice-agent-api (and its tools, connect-your-own-llm, events-reference and session-history pages)
+- Model and pricing references: https://www.assemblyai.com/llms/models.md, https://www.assemblyai.com/pricing.md, https://www.assemblyai.com/pricing
 
-GitHub (read directly): AssemblyAI/assemblyai-python-sdk, assemblyai-node-sdk, cli, blurt, assemblyai-pipecat-reference-voice-agent, assemblyai-livekit-reference-voice-agent, voice-agent-starter-python, assemblyai-mcp, voice-standard-bench; pipecat-ai/pipecat; livekit/agents.
-
-Third-party: MarkTechPost (29 Oct 2026) on TTS-1; LiveKit field guide "LiveKit vs Pipecat"; Fora Soft "Pipecat vs LiveKit Agents"; Cekura AssemblyAI pricing round-up; usagepricing.com Dictation API entry; jambonz AssemblyAI voice agent tutorial.
+GitHub, read directly: AssemblyAI/assemblyai-livekit-reference-voice-agent, AssemblyAI/assemblyai-pipecat-reference-voice-agent, AssemblyAI/blurt, AssemblyAI/cli, AssemblyAI/voice-standard-bench.

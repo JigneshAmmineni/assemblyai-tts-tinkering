@@ -1,274 +1,281 @@
-# How Wispr Flow Works Under the Hood: A System-Design Teardown
+# How Wispr Flow Works Under the Hood: A System-Design Teardown (revised)
 
-**Date:** 2026-10-31
-**Scope:** Wispr Flow (wisprflow.ai), the closed-source voice dictation app from Wispr Inc. Everything below comes from public sources. Each claim carries one of four confidence labels:
+**Date:** 2026-11-01 (revises the 2026-10-31 version)
+**Scope:** Wispr Flow (wisprflow.ai), the closed-source voice dictation app from Wispr Inc. Everything below comes from public sources. Each claim carries one of four confidence labels.
 
-- **[Confirmed]**: stated by Wispr, or by a vendor case study Wispr took part in.
-- **[Strongly implied]**: follows directly from primary evidence, including direct reading of reverse-engineered client code.
-- **[Third-party]**: a claim by a reviewer, competitor, or analyst that I could not verify against a primary source.
-- **[Speculation]**: my own inference.
+- **[Confirmed]** means Wispr stated it, or a vendor case study Wispr took part in states it.
+- **[Strongly implied]** means it follows directly from primary evidence, including direct reading of reverse-engineered client code.
+- **[Third-party]** means a reviewer, competitor, journalist, or community analyst said it and I could not check it against a Wispr primary source.
+- **[Speculation]** means it is my own inference.
 
-> **Method note.** In this research environment, direct page fetches to `wisprflow.ai`, `docs.wisprflow.ai`, and `baseten.co` were blocked at the network level. Wispr's and Baseten's primary pages were therefore read through search-engine extracts, not full-page fetches. The one exception is the reverse-engineered `wisprflow-sdk` repository, which I cloned and read in full. Quotes from Wispr pages are as close to verbatim as the extracts allowed. Check exact wording at the linked URLs before quoting it externally.
+> **Method note.** This revision was done from a desktop session where direct page fetches worked for most sites. I fetched and read these primary pages directly: Wispr's engineering and research posts (technical challenges, speech recognition challenges, supporting 100 languages, Canto, the Lab page), the What's New changelog, the privacy policy, terms of service, Data Controls page, and enterprise privacy overview; the docs.wisprflow.ai help articles on Context Awareness, Smart Formatting and Backtrack, Auto Cleanup, IDE use, Android formatting, the security FAQ, and Notetaker privacy; the Baseten case study; and the `wisprflow-sdk` README, `TECHNICAL_DETAILS.md`, and `_core.py` (via raw GitHub). I also read the SE Radio 703 transcript page, Computerworld, Dev Interrupted, VKTR, Pulse 2.0, and the community analyses listed in the sources. **Could not access:** x.com posts (HTTP 402), so the Wispr and Tanay Kothari posts on X are unverified; the docs.wisprflow.ai subprocessor article and `/privacy/overview` (both 404); the `backant-io/shepetal` PR #6 (404); Android Authority (403); and the Trust Center subprocessor list, which Wispr keeps behind an NDA. SE Radio 715 has no public transcript, only a publisher summary. My fetch tool returns condensed page text, so short quotes below are as close to verbatim as that allowed; check exact wording at the URL before quoting externally.
 
 ---
 
 ## Executive summary
 
-1. **STT model.** Until September 2026, Wispr never publicly named its speech recognizer. Its stated engineering budget was "<200 ms ASR" on infrastructure hosted by Baseten. On 2026-08-17 Wispr previewed **Canto**, its first in-house speech model, and made it the default for all users around mid-September 2026 **[Confirmed]**. Canto has about 2B parameters and starts from a pretrained speech-text model. Wispr then trains it with supervised fine-tuning (SFT) followed by GRPO reinforcement learning, and the model takes the user's personal vocabulary as runtime context **[Confirmed]**. What powered Flow's speech recognition before Canto (fine-tuned open model, vendor API, or both) is **unknown**.
-2. **Cleanup.** Cleanup is a separate LLM post-processing stage on the server. It ran on **fine-tuned Llama models** served on Baseten with TensorRT-LLM **[Confirmed via Baseten case study]**. Computerworld reports **Llama 3.1 plus proprietary models "from the likes of OpenAI"** **[Third-party press]**. Subprocessor lists include OpenAI, Anthropic, and Cerebras as LLM providers **[Third-party]**. Self-corrections ("2, actually 3") are handled by a feature Wispr calls **Backtrack** **[Confirmed]**.
-3. **Context.** The server receives a lot of context. Wispr's docs list the app category, textbox contents before, after, and around the cursor, on-screen text read via accessibility APIs, names visible on screen, and variable and file names in IDEs **[Confirmed]**. The reverse-engineered protocol adds the app name, bundle ID, URL, a screenshot field, OCR tokens, a personal dictionary, replacements, snippets, per-app writing style (formal, casual, very casual, excited), and an editing-strength setting **[Strongly implied]**.
-4. **Latency.** Wispr's target is **under 700 ms from the end of speech to formatted text**, budgeted as <200 ms ASR, <200 ms LLM, and <200 ms network **[Confirmed]**. Baseten states the target as **p99 < 700 ms**, with the LLM producing **100+ tokens in under 250 ms** **[Confirmed]**. The client opens one **bidirectional gRPC stream** to a Baseten endpoint. It sends preferences and context first, then audio packets *while you speak*, and closes with a "FINAL" commit when you release the key **[Strongly implied]**. Text is inserted once, after release. Speech recognition overlaps with speaking, while the LLM cleanup almost certainly runs on the whole utterance after the FINAL commit **[Strongly implied]**.
-5. **Streaming cleanup.** Flow does **not** insert cleaned text incrementally on desktop. The wire protocol does carry partial `raw_text` and `formatted_text` frames, so the server *can* produce provisional formatting, but nothing shows Flow displaying it. Aqua Voice offers both modes: "Instant" inserts ~450 ms after you stop speaking, and "Streaming" shows words live. Google's Gboard "Rambler" is reported to clean up speech as it arrives. Doing cleanup during streaming requires commit/revise semantics, because a self-correction can rewrite text spoken seconds earlier. Research on re-translation "erasure", LocalAgreement, and wait-to-commit disfluency tagging gives workable patterns (Section 5).
+1. **Did Wispr train its own STT model?** Yes, since 2026. Wispr previewed **Canto**, "the first speech model we've built ourselves", on 2026-08-17 alongside its Series B, published the technical post on 2026-09-17, and rolled it out to all users the same day **[Confirmed]**. Canto starts from an unnamed pretrained speech-text model, is trained with SFT and then GRPO reinforcement learning, and takes the user's dictionary terms as runtime context **[Confirmed]**. Press reports it at about 2B parameters **[Third-party press]**. Before Canto, Wispr described its recognizer as "an ensemble of speech recognition models" with per-language engine selection, without naming vendors **[Confirmed]**. The CTO said in January 2026 that "we host all of the models ourselves" **[Confirmed]**, and the client streamed to a Baseten-hosted model, so the main English path was most likely a self-hosted model on Baseten, with vendor APIs (OpenAI transcription, ElevenLabs) as fallbacks or for some languages **[Strongly implied / Third-party]**.
+2. **Disfluent speech and self-corrections.** Cleanup is a separate LLM stage after ASR. Baseten's case study says it is a fine-tuned **Llama** model served with TensorRT-LLM and Baseten Chains **[Confirmed]**, and Wispr's terms say it "may use OpenAI or Anthropic LLMs" to generate outputs **[Confirmed]**. **Backtrack** removes fillers, false starts, and clear self-corrections using the whole dictation as context ("coffee at 2 actually 3" becomes "coffee at 3"), while keeping non-corrective uses of cue words **[Confirmed]**. Smart Formatting adds punctuation, lists, numbers as digits, paragraph breaks, and spoken commands like "new line" **[Confirmed]**. Auto Cleanup has None, Light (default), and Medium levels **[Confirmed]**.
+3. **Context beyond model weights.** Confirmed by Wispr: app category, text before, after, and selected around the cursor, on-screen text read through accessibility APIs, names on screen, variable and function names visible in Cursor, Windsurf, and VS Code, the user's in-app identifier, the apps in the session, the personal dictionary, snippets, per-app Styles, and learning from user edits **[Confirmed]**. Wispr says it "does not take screenshots" **[Confirmed]**, yet the wire protocol has `screenshot`, `screen_ocr`, and (per a later analysis) chat-conversation fields **[Strongly implied / Third-party]**. Use of past dictations and "previous threads" for tone is reported in press interviews but not documented as a per-request input **[Third-party press]**.
+4. **Low latency.** Target: formatted text within 700 ms of the end of speech, at **p99**, budgeted as <200 ms ASR, <200 ms LLM, and <200 ms network **[Confirmed]**. The LLM must process and generate 100+ tokens in under 250 ms **[Confirmed]**. The CTO credits a speculative decoding trick that guesses unchanged words will be copied through, cutting LLM latency "by over half in a lot of our cases" **[Confirmed]**. The client opens a bidirectional gRPC stream to Baseten, sends preferences and context first, streams audio during speech, and sends one FINAL commit on key release **[Strongly implied]**. Dictation latency fell 30% in the first half of 2026 **[Confirmed]**.
+5. **Real-time and streaming cleanup.** Flow inserts cleaned text once, after release; it does not show a live cleaned transcript while dictating **[Strongly implied]**. The protocol carries partial `raw_text` and `formatted_text` frames, and one static analysis says the server uses "previous chunks' raw and LLM text for continuity" **[Strongly implied / Third-party]**, so some chunked server-side formatting probably exists. Wispr's Notetaker does show a live transcript and then re-processes the whole recording at the end **[Confirmed]**. Google's Gemini 3.5 Transcribe Live has a SMART mode that emits cleaned text per finalized segment, with speculative interim text in between **[Confirmed by Google docs]**. Aqua Voice's Realtime Mode shows live words but still lands text when you finish **[Confirmed by Aqua]**. Streaming cleanup is feasible with segment-level commit, a one-segment hold-back, and a final tail pass at release. Section 5 gives a concrete design on AssemblyAI's stack.
+
+### Main corrections versus the 2026-10-31 version
+
+- **Canto details.** The Canto page does not state a parameter count; "about 2B" comes from press. The distractor-vocabulary training was a research experiment that Wispr says "extend[s] beyond" the training used for the released model, so it is not a confirmed production technique. The comparison set (Google, OpenAI, AssemblyAI, Deepgram) is now confirmed directly; Canto lost to Gemini 3.1 Pro on Wispr's challenge set and all evaluations were English. The X-post figure of 3.4% WER could not be verified.
+- **Pre-Canto ASR.** The old report called it "unknown". Wispr's own January 2026 post says it used an ensemble with per-language engine selection, and the CTO said Wispr hosts its models itself. That narrows the answer considerably.
+- **Commit semantics.** The old report said every audio packet carries a `Commit(NON_FINAL)`. The SDK code sends NON_FINAL commits only after the Init and Context messages, sends audio packets with no commit, and attaches the single FINAL commit to the last packet.
+- **Clipboard paste.** The old report sourced paste insertion to the BoringNotch issue, which does not say that. Wispr's own IDE doc confirms paste (Shift+Insert on Windows in IDEs).
+- **Auto Cleanup levels.** The "High"/HEAVY level is no longer selectable; the documented levels are None, Light, Medium.
+- **Aqua Voice.** Its "Streaming Mode" was renamed Realtime Mode in July 2026, lands text only when you finish, and runs on a third-party realtime speech provider rather than Aqua's Avalon model.
+- **Hosting.** Wispr confirms AWS with Northern Virginia primary and Northern California failover; Baseten confirms dedicated deployments on AWS workload planes.
+- **The 2025 screenshot incident.** On closer reading, the sources for the user ban and the CTO apology are competitor blogs citing other reviews; no primary record was found. It is downgraded to weakly sourced.
+- **New primary evidence.** SE Radio 703 (speculative decoding, self-hosting, GPU co-location), Computerworld ("looks at your previous threads"), the "AI apps skip formatting" rule, and a new static analysis of client v1.6.1174 (HTTP and OpenAI fallbacks, mid-utterance context updates, server-side chunk continuity).
 
 ---
 
-## 1. STT model: own model or third-party ASR?
+## 1. Did Wispr train its own STT model?
 
-### What Wispr has said
+### Canto (2026)
 
-- **Before Canto.** In its engineering post "Technical challenges and breakthroughs behind Flow" (around September 2025), Wispr set an end-to-end ASR budget under 200 ms. It also said it was building "context-conditioned ASR models", conditioned on speaker qualities, surrounding context, and individual history ([Wispr: technical challenges](https://wisprflow.ai/post/technical-challenges)) **[Confirmed]**. The post does not say which recognizer was in production.
-- **Canto (2026).** Wispr announced Canto alongside its $280M Series B (Menlo Ventures, $2B valuation) on 2026-08-17, describing it as "our first in-house speech model" ([VKTR](https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/); [Wispr Flow on X](https://x.com/WisprFlow/status/2110085776369471596)) **[Confirmed]**. Details from the Canto page ([wisprflow.ai/canto](https://wisprflow.ai/canto)) **[Confirmed]**:
-  - Canto starts "from a model pretrained on millions of hours of speech and text". Training then runs in two stages: SFT on audio paired with transcripts, then RL with **GRPO**, where several candidate transcripts are sampled per clip and each complete output is scored.
-  - It takes the user's **personal vocabulary as runtime context**. Wispr trains with *distractor* vocabulary terms mixed with true ones so the model learns "when context deserves to be followed", not just to copy the list.
-  - It is described as the first model from "Wispr Advanced Interfaces Lab". A unified transcription-plus-diarization architecture is on the roadmap.
-  - Wispr says Canto had "the lowest WER" among the real-time models it evaluated. One summary says the comparison included Google, OpenAI, AssemblyAI, and Deepgram models ([Releasebot summary](https://releasebot.io/updates/wispr-flow); [BenchLM](https://benchlm.ai/models/wispr-canto)) **[Third-party summary of a Wispr claim]**.
-  - Reported numbers: about 2B parameters. WER in hard acoustic conditions falls from over 30% to roughly 5–10%. The share of dictations that need manual edits falls by 30–35% ([VKTR](https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/); [Pulse 2.0](https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/)). A post attributed to CEO Tanay Kothari cites **3.4% WER on 10 hours of real Flow dictations from more than 2,300 speakers** ([X/@tankots](https://x.com/tankots/status/2100680985423843608)). Wispr did not publish test languages or the comparison models in full, and there is no independent benchmark **[Confirmed as claim; unverified]**.
-  - Canto became the default for everyone around 2026-09-17 ([Wispr What's new](https://wisprflow.ai/whats-new); [BenchLM](https://benchlm.ai/models/wispr-canto)) **[Confirmed / Third-party date]**.
-- **Why they built it.** Press coverage says the founders judged general-purpose models such as Whisper "good but not great". The problems cited were hallucinated words, weak handling of accents and code-switching, and no adaptation to the user ([Pulse 2.0](https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/amp/)) **[Third-party press quoting Wispr]**. CTO Sahaj Garg's LinkedIn profile says a "deep personalization stack" has to be built into the speech model itself ([LinkedIn](https://www.linkedin.com/in/sahajgarg/)).
-- **Multilingual.** Wispr's research post on supporting 100 languages describes **per-language engine selection**, which it says more than halves error rates in internal tests. The post notes that standard models do poorly on Hindi, Marathi, Thai, and Tamil, and discusses romanized-Hindi output for Hinglish ([Wispr research: supporting languages](https://wisprflow.ai/research/supporting-languages)) **[Confirmed]**. "Engine selection" strongly implies that, at least before Canto, **several ASR backends were routed per language**, some of which were probably third-party **[Strongly implied / Speculation on the vendors]**.
+- **Announcement and rollout.** VKTR and Pulse 2.0 reported Canto in preview on 2026-08-17, with the $280M Series B ([VKTR](https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/); [Pulse 2.0](https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/)) **[Third-party press]**. Wispr's changelog entry for 2026-09-17 says Flow now runs on Canto for all users ([What's new](https://wisprflow.ai/whats-new)) **[Confirmed]**. The Canto research post is dated the same day and is credited to the Wispr Advanced Interfaces Lab, led by Chief Science Officer Ariya Rastrow ([Canto](https://wisprflow.ai/canto); [Lab](https://wisprflow.ai/lab)) **[Confirmed]**.
+- **Training** ([Canto](https://wisprflow.ai/canto)) **[Confirmed]**:
+  - It starts from a model "pretrained on millions of hours of speech and text". The base model is not named.
+  - Stage one is SFT on audio paired with reference transcripts.
+  - Stage two is RL with GRPO. Several candidate transcripts are sampled per clip, each is scored (the example reward is 1 minus WER), and advantages are computed relative to the group.
+  - User corrections become training signal. Forced-alignment confidence and the shape of each edit pick out likely recognition errors, and only those corrections are grafted into the reference.
+- **Runtime context.** Canto receives vocabulary from the user's dictionary at inference time to recover names and rare terms **[Confirmed]**. Wispr also reports research runs with phonetically similar *distractor* terms. After RL, the model adopted the most similar distractors "nearly five times as often" as the SFT model, and mixing distractors with true terms in training reduced false-context following. Wispr notes these experiments go beyond the released model's training, so treat the distractor technique as research, not a confirmed production feature **[Confirmed as research]**.
+- **Evaluation** ([Canto](https://wisprflow.ai/canto)) **[Confirmed as Wispr's claim; no independent benchmark]**:
+  - On 10 hours of real dictations from 2,300+ speakers, Canto had the lowest WER among models from Google, OpenAI, AssemblyAI, and Deepgram.
+  - On a 3-hour challenge set it ranked second, behind Gemini 3.1 Pro, which Wispr calls too large for real-time use. Gemini led on noisy audio.
+  - It tied for lowest on LibriSpeech and was competitive but not leading on FLEURS and Common Voice.
+  - All evaluations were English; exact WER values appear only in charts. A successor is being trained at more than 10x Canto's scale, with more languages and unified transcription plus diarization on the roadmap.
+- **Press numbers.** About 2B parameters ([VKTR](https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/)); WER in hard conditions falling from over 30% to roughly 5 to 10%, and an expected 30 to 35% fewer dictations needing edits ([Pulse 2.0](https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/)) **[Third-party press quoting Wispr]**. A 3.4% WER figure attributed to an X post by CEO Tanay Kothari could not be checked because x.com was not reachable **[Unverified]**.
 
-### Hosting and vendors
+### What powered Flow before Canto
 
-- Baseten hosts Wispr's models. The reverse-engineered client opens its gRPC stream to `model-<id>.grpc.api.baseten.co`, using the service `flow_api.v1.TranscriptionService/TranscribeStream` ([wisprflow-sdk TECHNICAL_DETAILS.md](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**. A single Baseten-hosted service carrying both `raw_text` and `formatted_text` fits a Baseten **Chains** pipeline (ASR step → LLM step), which Baseten's case study names ([Baseten case study](https://www.baseten.co/resources/customers/wispr-flow/)).
-- Subprocessors reported by third parties include Baseten, OpenAI, Anthropic, Cerebras, and AWS us-east-1 ([Voibe](https://www.getvoibe.com/resources/wisprtype-vs-wispr-flow/)). A stricter audit says DPA Annex 2 lists 34 entities, including Fireworks AI, Google, OpenPipe, Modal Labs, and ElevenLabs. The same audit says the public Trust Center list changed between snapshots, from 24 to 29 entities, and later moved behind an NDA ([Routines audit](https://getroutines.ai/transparency/wispr-flow)) **[Third-party]**. **Groq does not appear in any source** I found.
-- **Before Canto: unknown.** No primary source names Whisper, Deepgram, AssemblyAI, Google, or ElevenLabs as Flow's recognizer. Comparison sites say outright that Wispr "does not publicly disclose" the model ([Voibe](https://www.getvoibe.com/resources/openai-whisper-vs-wispr-flow/)). One explainer claims GPT-Transcribe and Whisper-large-v3-turbo ([Forasoft](https://www.forasoft.com/learn/ai-for-video-engineering/articles-ai/whisper-flow-app-engineering-walkthrough)), but I could not corroborate it **[Third-party, low confidence]**. Several signals point to a mix of self-hosted fine-tuned open models on Baseten and vendor APIs as fallbacks or for some languages: the ElevenLabs, Google, and OpenAI subprocessors, the per-language "engine selection" language, and the job posts about "personalization of our speech models … with fine-tuning and RL" ([Ashby job post](https://jobs.ashbyhq.com/wispr-flow/9cf022b6-55b1-4fcc-940a-6988bd94b6d3)) **[Speculation]**.
+- **Wispr's own description.** CTO Sahaj Garg's January 2026 post says Flow "dynamically selects the most accurate ASR ... engine for each language" and "uses an ensemble of speech recognition models", which cut error rates by more than half in internal tests. It also uses "accent confidence scoring" to compare multiple transcriptions ([Supporting 100 languages](https://wisprflow.ai/research/supporting-languages)) **[Confirmed]**. The post names Scribe, Gemini, and Whisper only in a WER comparison, not as components of Flow.
+- **Self-hosting.** On SE Radio 703 (2026-01-14), Garg said "we host all of the models ourselves" and described a speech model plus an LLM in the pipeline ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**. The client's default gRPC target in April and June 2026 was a Baseten model (`model-v31pl413`) that returns both raw and formatted text ([wisprflow-sdk TECHNICAL_DETAILS](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md); [Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation)) **[Strongly implied]**. Together these mean the main path before Canto was a model Wispr deployed itself on Baseten. Which open or licensed model that was is not public **[Strongly implied / identity unknown]**.
+- **Vendor fallbacks.** A transparency audit of the DPA's subprocessor annex says OpenAI Whisper is a fallback speech path and ElevenLabs is used for certain languages ([Routines](https://getroutines.ai/transparency/wispr-flow)) **[Third-party]**. A static analysis of client v1.6.1174 found a backend fallback that "proxies an OpenAI transcription" ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**. Both fit the "ensemble" wording.
+- **Changelog trail.** June 2026 entries mention an upgraded speech model in progress and say everyone was moved onto "the same current model" after some dictations had been handled by older models ([What's new](https://wisprflow.ai/whats-new)) **[Confirmed]**.
+- **Motivation.** Wispr's research post argues that moving English WER from 3% to 2% "hardly made a dent" on its hard test sets, because the audio is ambiguous without context ([Speech recognition challenges](https://wisprflow.ai/research/speech-recognition-challenges)) **[Confirmed]**. A 2026 job listing asked for "scaling the personalization of our speech models and LLMs with fine-tuning and RL" ([Built In listing](https://builtin.com/job/ml-engineer/7257184)) **[Confirmed]**.
 
-**Answer:** Today, Wispr runs its own model (Canto) **[Confirmed]**. Before September 2026, the recognizer was never disclosed and was probably a routed mix **[Speculation]**.
+**Answer.** Wispr now runs its own model, Canto **[Confirmed]**. Before that it ran an ensemble that it describes but does not name, most likely a self-hosted model on Baseten for the main path with vendor APIs for fallback and some languages **[Strongly implied / Third-party]**.
 
 ---
 
-## 2. Cleanup of disfluent, self-corrected speech
+## 2. Cleanup of disfluent and self-corrected speech
 
 ### Architecture
 
-- Cleanup is a **separate LLM stage after ASR**. Baseten: "Sahaj and his team chose Llama … as the base for their real-time transcript cleanup step", "fine-tuned these LLMs to precisely solve user tasks based on the users' context and preferences", served with Baseten's TensorRT-LLM engine builder and Chains ([Baseten](https://www.baseten.co/resources/customers/wispr-flow/)) **[Confirmed]**.
-- Computerworld: "For text editing, it uses the open-source Llama 3.1 model, combined with proprietary models from the likes of OpenAI" ([Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html)) **[Third-party press]**. The same piece quotes Wispr describing "voice-first models" trained to learn transcription, formatting, and intent together, "rather than bolting speech recognition onto a general-purpose language model". That reads as a direction of travel, not a description of the shipped stack.
-- **The wire protocol confirms the two-stage split.** Server frames carry a `State` message with `raw_text` (ASR) and `formatted_text`, plus a `Result` with `result_html`, `result_plaintext`, and a status (`FORMATTED`, `ERROR`, or `RAW_TRANSCRIPT`). A `disable-formatting` gRPC header exists, so the LLM pass can be skipped, and the client falls back to raw text if formatting fails ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**.
-- **Controls the client sends to the formatter** ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**:
-  - `WRITING_STYLE` ∈ {FORMAL, CASUAL, VERY_CASUAL, EXCITED}, configured **per app type** (personal, work, email, other)
-  - `EDITING_STRENGTH` ∈ {VERBATIM, LIGHT, MEDIUM, HEAVY}
-  - `APP_TYPE` ∈ {other, browser, personal, work, email, chatbot, developer}
-  - email signature settings
-  - a personal dictionary, starred terms, replacements, and snippets
+- **A separate LLM stage.** Baseten's case study says Wispr chose Llama "as the base for their real-time transcript cleanup step", fine-tuned it for users' context and preferences, and serves it with Baseten's TensorRT-LLM engine builder and Chains for multi-step inference ([Baseten](https://www.baseten.co/resources/customers/wispr-flow/)) **[Confirmed]**. Garg is quoted there saying Llama is "controllable and customizable". The version and size are not given.
+- **Other LLMs.** Wispr's terms (updated 2026-08-19) say "Wispr may use OpenAI or Anthropic LLMs as Third-Party Services to generate Outputs" ([Terms](https://wisprflow.ai/terms)) **[Confirmed]**. Computerworld reports Llama 3.1 for text editing "combined with proprietary models from the likes of OpenAI" ([Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html)) **[Third-party press]**. The DPA annex reportedly also lists Cerebras, Fireworks AI, OpenPipe, and Modal Labs ([Routines](https://getroutines.ai/transparency/wispr-flow)) **[Third-party]**. Which feature uses which model is not public. Command Mode, Polish and other Transforms, and Notetaker summaries are plausible users of the OpenAI and Anthropic models **[Speculation]**.
+- **More than two models.** Garg said speculative decoding freed enough budget to add "a third and fourth model" to the pipeline ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**. One client analysis reports a separate LLM call that extracts proper nouns from screen text ([Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation)) **[Third-party]**, and Wispr's context doc refers to "extracted names" per dictation ([Context Awareness](https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness)) **[Confirmed]**. Another analysis lists client-requested pipeline steps "transcribe, align, format", plus optional sentence lowercasing, and a server-side "semantic auto-stop" model ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**.
+- **The wire protocol shows the split.** Server frames carry a `State` with `raw_text` and `formatted_text`, and a `Result` with HTML and plaintext and a status of FORMATTED, ERROR, or RAW_TRANSCRIPT. A `disable-formatting` header exists ([wisprflow-sdk](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md)) **[Strongly implied]**. Wispr's docs confirm that if formatting fails, Flow pastes the raw transcript ([Smart Formatting & Backtrack](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack)) **[Confirmed]**.
+- **Formatter conditioning variables** in the protocol ([wisprflow-sdk `_core.py`](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/src/wisprflow_sdk/_core.py)) **[Strongly implied]**:
+  - writing style (FORMAL, CASUAL, VERY_CASUAL, EXCITED), sent per app category (personal, work, email, other)
+  - editing strength (VERBATIM, LIGHT, MEDIUM, HEAVY on the wire; how the UI levels map to it is the SDK author's guess)
+  - app type (other, browser, personal, work, email, chatbot, developer)
+  - personal dictionary, replacements, and snippets
+- **AI apps skip formatting.** Dictations into apps Flow recognizes as AI apps, and Command Mode dictations, skip formatting by design ([Auto Cleanup](https://docs.wisprflow.ai/articles/4283510616-auto-cleanup-control-how-much-flow-edits-your-dictation-beta)) **[Confirmed]**. This matches the `chatbot` app type in the protocol.
+- **Command Mode** is a separate voice feature for editing existing or selected text. Its edited text is pasted back ([Command Mode doc](https://docs.wisprflow.ai/articles/4816967992-how-to-use-command-mode)) **[Confirmed]**. The SDK implements it as `POST api.wisprflow.ai/llm/command_mode_route` with the full text, selection, instruction, and style settings ([wisprflow-sdk](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md)) **[Strongly implied]**. A static analysis says realtime "voice actions" use a WebSocket to a separate backend ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**.
 
-  These are essentially the LLM's conditioning variables.
-- **Command mode** (for example, "make this more formal" over selected text) uses a **separate REST call**: `POST api.wisprflow.ai/llm/command_mode_route` with `selected_text`, `instruction`, and style settings ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**.
+### Backtrack, fillers, and formatting
 
-### Self-correction ("Backtrack"), fillers, formatting
+From Wispr's docs ([Smart Formatting & Backtrack](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack); [Android formatting](https://docs.wisprflow.ai/articles/6568835559-why-wispr-flow-sometimes-removes-or-changes-words-on-android-smart-formatting); [Auto Cleanup](https://docs.wisprflow.ai/articles/4283510616-auto-cleanup-control-how-much-flow-edits-your-dictation-beta)) **[Confirmed]**:
 
-- Wispr's help doc "How do I use Smart Formatting & Backtrack" covers both features ([docs.wisprflow.ai](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack)) **[Confirmed]**:
-  - Backtrack removes filler words, false starts, and *clear* self-corrections.
-  - Cue words include "actually", "scratch that", and "never mind", but restating your intent also works.
-  - Non-corrective uses are kept ("I actually enjoyed the movie").
-  - Example: "Let's do coffee at 2 actually 3" → "Let's do coffee at 3".
-  - The original dictation is kept in Recent Activity.
-  - Smart Formatting (lists, punctuation, structure) is a separate toggle, and it "does not correct misheard words".
+- **Backtrack** removes filler words, false starts, and self-corrections. You can use a cue such as "actually", "scratch that", or "never mind", or just restate what you meant. Flow "uses your full dictation as context to decide what to change". Example: "Let's do coffee at 2 actually 3" becomes "Let's do coffee at 3". Only clear self-corrections are removed, so "I actually enjoyed the movie" survives.
+- **Spelled corrections** replace an earlier word only when the spelled word sounds similar; a very different-sounding correction is ignored.
+- **Smart Formatting** adds punctuation, lists (from "one... two..." or "first... second..."), line and paragraph breaks, and fixes filler, grammar, and capitalization. It "does not correct misheard words". Spoken numbers become digits with units ("four four five cleaners" becomes "445 cleaners"). It inserts paragraph breaks at topic shifts, drops spoken list markers, and avoids em dashes unless dictated.
+- **Spoken commands.** "period", "comma", "question mark", "colon", "new line", "new paragraph", and similar. Line and paragraph commands work even with Smart Formatting off.
+- **Auto Cleanup levels.** None (raw transcript including fillers and false starts), Light (default; removes fillers and fixes grammar), and Medium (may reword for clarity). High is no longer selectable. Writing Styles also control trailing periods (Formal keeps them; Casual drops them for up to 10 sentences).
+- **Undo.** The original transcript is kept. "Undo AI edit" in Recent Activity restores it.
+- **Length-dependent behavior.** Garg said short messages keep filler words to preserve tone, while longer dictations get more cleanup ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**.
 
-  This describes semantic rewriting by an LLM, not rule-based deletion **[Strongly implied]**.
-- **Learning from edits.** "Flow's formatter learns from real user edits (punctuation, spacing, and grammar corrections)" ([Wispr research](https://wisprflow.ai/research/supporting-languages)). The engineering post treats user corrections as the key signal, with a goal of driving them to zero ([Wispr](https://wisprflow.ai/post/technical-challenges)) **[Confirmed]**. Job posts mention "fine-tuning and RL / DPO" for personalization ([startup.jobs listing](https://startup.jobs/ml-engineer-wispr-ai-6425827)). Garg's SE Radio episode on ambiguity talks about learning "revealed preferences" from behavior without explicit feedback ([SE Radio 715](https://se-radio.net/2026/04/se-radio-715-sahaj-garg-on-designing-for-ambiguity-in-human-input/)) **[Confirmed in outline]**. OpenPipe, a fine-tuning and RL platform, appearing in the DPA annex fits this picture **[Third-party / Speculation]**.
-- **Not disclosed:** the prompt format, whether there is one model per style or per app, model sizes (Baseten's "100+ tokens in <250 ms" fits an 8B-class model on H100s with TensorRT-LLM **[Speculation]**), and when OpenAI, Anthropic, or Cerebras models are used instead of Llama. Plausible uses are command mode, long dictations, and fallback **[Speculation]**.
+This is semantic rewriting by an LLM conditioned on the whole utterance, not rule-based deletion **[Strongly implied]**. The examples need right-hand context: "2 actually 3" cannot be resolved until "3" is heard.
+
+### Learning from edits
+
+- "Flow's formatter learns from real user edits (punctuation, spacing, and grammar corrections)", including regional email conventions and greeting styles ([Supporting 100 languages](https://wisprflow.ai/research/supporting-languages)) **[Confirmed]**.
+- The engineering post describes capturing edits on device, deciding which generalize, and training a "local RL policy" toward a product that "never makes the same mistake twice" ([Technical challenges](https://wisprflow.ai/post/technical-challenges)) **[Confirmed]**. It also notes that "LLMs are phenomenal at recall, but very low precision" for style rules.
+- About 25 to 30% of users opt in to sharing data for training ([Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html)) **[Third-party press]**.
+- **Not disclosed:** prompt format, model sizes, whether styles are separate adapters, and routing between Llama and the OpenAI or Anthropic models. "100+ tokens in under 250 ms" is consistent with an 8B-class model on modern GPUs with TensorRT-LLM plus speculative decoding **[Speculation]**.
 
 ---
 
-## 3. Context awareness
+## 3. Context beyond the model weights
 
-### What the product docs say
+### Confirmed by Wispr
 
-From Wispr's "Context Awareness" help article ([docs.wisprflow.ai](https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness)) **[Confirmed]**:
+From the Context Awareness article ([docs](https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness)) **[Confirmed]**:
 
-- Flow reads text near the cursor.
-- It classifies the active app as Email, Work messaging, Personal messaging, or Other.
-- It uses names visible on screen, such as email recipients, to spell proper nouns correctly.
-- Context can include app information, textbox contents (before, selected, and after the cursor), on-screen text, variable and file names in coding apps, and your user identifier within the app.
-- It "works from text and does not take screenshots".
-- It requires macOS Accessibility permission.
-- On Android, Accessibility lets Flow read on-screen text, field layout, and app or website names. Flow skips password and credit-card fields, banking apps, and password managers ([Android setup doc](https://docs.wisprflow.ai/articles/8858845757-setup-wispr-flow-on-android-android-settings)).
+- It is on by default. On Mac it needs Accessibility permission; Windows needs none.
+- Inputs: app info with a category (Email, Work messaging, Personal messaging, Other); textbox contents before, selected, and after the cursor; on-screen text; variable and file names in coding apps; your user identifier within the app; and the apps in your current session.
+- Uses: names on screen (email recipients, for example) for proper nouns and capitalization; casing and punctuation that match surrounding text; email greetings and sign-offs; continuing a sentence after an emoji or closing quote.
+- Exclusions: password fields, sensitive and numeric-only fields, URL bars, placeholder text, and banking apps. Custom or web password fields "may be read like normal text fields".
+- "Flow works from text and does not take screenshots."
+- Captured text and extracted names are cleared when the dictation ends.
+- **With context off** on Mac and Windows, Flow still sends the app name and website domain, and "nearby text is used only on the device and is not sent". That implies some formatting logic (spacing or casing continuation) runs locally **[Strongly implied]**.
+- On iPhone, the keyboard sends the text around the cursor, the selection, and the app name.
 
-Per-app tone ("Styles": formal in email, casual in personal chat) is a documented feature. It matches the `styleConfig` keyed by app type in the protocol.
+Other confirmed context sources:
 
-### What the privacy policy says
+- **IDEs.** Flow reads "visible variable, function, and class names from the frontmost supported IDE" (Cursor, Windsurf, VS Code), which requires the IDE's screen-reader mode. File tagging inserts `@file` mentions in Cursor and Windsurf chat for files open in a tab or visible in the sidebar ([IDE doc](https://docs.wisprflow.ai/articles/6434410694-use-flow-with-cursor-vs-code-and-other-ides)) **[Confirmed]**.
+- **Dictionary.** A personal dictionary with starred words, usage-based ranking, auto-add, and org-wide shared entries ([What's new](https://wisprflow.ai/whats-new)) **[Confirmed]**, fed to Canto as runtime vocabulary ([Canto](https://wisprflow.ai/canto)) **[Confirmed]**.
+- **Styles.** Per-category tone settings (Personal, Work, Email, Other), with app recognition for Instagram, Discord, Signal, and LinkedIn ([What's new](https://wisprflow.ai/whats-new); [Styles doc](https://docs.wisprflow.ai/articles/2368263928-how-to-setup-flow-styles)) **[Confirmed]**.
+- **Personal history in principle.** Wispr's research post frames recognition as using app context, "history of relevant topics they talk about", common names and terms, and voice embeddings ([Speech recognition challenges](https://wisprflow.ai/research/speech-recognition-challenges)). The engineering post describes "context-conditioned ASR models (conditioned on speaker qualities, surrounding context, and individual history)" ([Technical challenges](https://wisprflow.ai/post/technical-challenges)) **[Confirmed as direction; not documented as shipped inputs]**.
 
-The policy's "Customer Content" section covers audio inputs, meeting data, and "contextual information you choose to provide". If Context Awareness is enabled, Wispr "may collect limited content from the app in use, such as on-screen text, to improve output accuracy" ([Wispr privacy policy](https://wisprflow.ai/privacy-policy), as extracted via search) **[Confirmed]**. A critical analysis of the version updated 2026-07-25 says the policy names "the application used for dictation" but contains none of the words keystroke, keyboard, typing, URL, or browsing ([Voibe](https://www.getvoibe.com/resources/is-wispr-flow-safe/)) **[Third-party]**. Wispr's Data Controls page says usage statistics such as word counts are collected regardless of settings ([wisprflow.ai/data-controls](https://wisprflow.ai/data-controls)). Third parties report that training on user data is opt-in or off for Enterprise and HIPAA accounts, with a zero-retention "Privacy Mode" ([Voibe](https://www.getvoibe.com/resources/is-wispr-flow-safe/)) **[Third-party]**.
+### Reported in interviews, not documented
 
-### What the client actually sends (reverse-engineered)
+- Kothari told Computerworld that Flow "looks at your previous threads" to infer tone, such as formality or starting in lowercase ([Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html)) **[Third-party press]**. This most likely means the visible conversation in the active app rather than a server-side history store **[Speculation]**.
+- The Deep View says Flow uses screen context, conversation history, and corrections ([The Deep View](https://archive.thedeepview.com/p/wispr-flow-preps-voice-ai-s-next-breakthrough)) **[Third-party press]**.
 
-The `ContextRequest` message in the gRPC stream contains the following fields ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**:
+### What the client sends (reverse-engineered)
+
+The `ContextRequest` in the gRPC stream has these fields ([wisprflow-sdk](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md)) **[Strongly implied]**:
 
 - **Textbox:** `before_text`, `after_text`, `selected_text`, `textbox_contents`
-- **Screen:** `content_text`, `content_html`, and a `screenshot` bytes field
+- **Screen:** `content_text`, `content_html`, `screenshot` (bytes)
 - **App:** `app_name`, `bundle_id`, `url`, `session_apps`
-- **Dynamic vocabulary:** `screen_ax` (accessibility-tree tokens), `screen_ocr` (OCR tokens), `variable_names`, and `file_names`, each capped at 50 items
+- **Dynamic vocabulary** (up to 50 items each, gated by `allow_dynamic_vocab`): `screen_ax`, `screen_ocr`, `variable_names`, `file_names`
 
-The `InitRequest` carries the user profile (name, email), languages, personal dictionary, replacements, snippets, and style preferences.
+`InitRequest` carries the profile, languages, vocabulary, replacements, snippets, and styles.
 
-Independent analyses add more detail:
+A later static analysis of v1.6.1174 adds an optional chat-conversation field in the context message, optional prior state in Init, and an `updateContext` call that re-sends context mid-utterance ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party; written by an AI agent doing a static read]**.
 
-- One write-up says the app walks the accessibility tree up to 214 elements and 9 levels deep. It says Flow streams **OPUS** audio over gRPC to Baseten along with accessibility text, app names, URLs, and extracted proper nouns. It also says a local `flow.sqlite` stores audio, transcripts, and textbox contents ([Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation)) **[Third-party]**.
-- A 2025 incident showed active-window screenshots being uploaded as part of Context Awareness. A Reddit user who reported it was banned, after which CTO Sahaj Garg apologized and Context Awareness was reworked with explicit toggles ([Embertype](https://embertype.com/blog/the-day-wispr-flow-banned-a-user/); [ModelPiper](https://modelpiper.com/blog/wispr-flow-privacy-incident); [Kintal](https://kintal.co/thinking/what-wispr-flow-actually-does)) **[Third-party; dates conflict across sources]**.
-- Voibe reports a separate "Screen OCR" control ([Voibe](https://www.getvoibe.com/resources/is-wispr-flow-safe/)) **[Third-party]**.
+Wensen Wu's analysis of v1.4.752 logs found accessibility walks of 194 to 214 elements at depth 9, proper nouns extracted by a separate LLM call, an hourly `/history/upload` of metadata, and a local `flow.sqlite` holding audio, ASR and formatted text, edited text, textbox contents, and accessibility text ([Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation)) **[Third-party]**. The local database means past dictations exist on device, but nothing shows them being sent with each request **[Unknown]**.
 
-The `screenshot` and `screen_ocr` fields in the protocol mean pixel-derived context is at least supported. That sits uneasily with the doc's "does not take screenshots" line, unless screenshots are OCR'd on the device or the feature is off by default **[Strongly implied / unresolved]**.
+### Screenshots: unresolved
 
-### How the context is used
+The protocol has `screenshot` and `screen_ocr` fields, and the local database has a `screenshot` column **[Strongly implied / Third-party]**. Wispr's doc says it does not take screenshots **[Confirmed]**. A transparency audit quotes Wispr's security FAQ describing a separate "Screen OCR" component that is "default off" ([Routines](https://getroutines.ai/transparency/wispr-flow)) **[Third-party]**. Reports of a 2025 incident in which active-window screenshots were uploaded and a user was banned rest on competitor blogs citing other reviews, with no primary record ([Embertype](https://embertype.com/blog/the-day-wispr-flow-banned-a-user/); [ModelPiper](https://modelpiper.com/blog/wispr-flow-privacy-incident)) **[Third-party, weakly sourced]**. The likely reconciliation is an optional, off-by-default OCR path, but that is not confirmed **[Speculation]**.
 
-There are two channels. **ASR biasing**: Canto takes personal vocabulary at runtime, and the "dynamic vocabulary" scraped from the screen is almost certainly fed as bias terms **[Confirmed / Strongly implied]**. **LLM conditioning**: textbox before and after text for continuity and capitalization, app type for style, and recipient names for spelling **[Strongly implied]**. The engineering post says "most personalization data must live on a user's device", so the client chooses what to send each time ([Wispr](https://wisprflow.ai/post/technical-challenges)) **[Confirmed]**. Prior dictations are not shown to be sent per request, though the local database keeps them **[Unknown]**.
+### Data handling
+
+- Hosting is AWS in the US, primary Northern Virginia with Northern California failover; transcription is cloud-only, with no on-prem or offline option ([Enterprise privacy](https://wisprflow.ai/post/enterprise-privacy-and-security-overview)) **[Confirmed]**.
+- Third-party LLM providers do not train on the data, which is "generally deleted within 30 days" ([Privacy policy](https://wisprflow.ai/privacy-policy)). The Data Controls page says Wispr "always maintains zero data retention agreements with all third-party AI providers", with a Notetaker exception ([Data Controls](https://wisprflow.ai/data-controls)) **[Confirmed; the two statements are not fully consistent]**.
+- Training on user data is controlled by "Improve the model for everyone" (formerly Privacy Mode) and is off for Enterprise and HIPAA accounts ([Data Controls](https://wisprflow.ai/data-controls)) **[Confirmed]**.
+- The subprocessor list is behind an NDA in the Trust Center ([Enterprise privacy](https://wisprflow.ai/post/enterprise-privacy-and-security-overview)). The audit reports 34 entities in DPA Annex 2, including AWS, OpenAI, Anthropic, Google, Baseten, OpenPipe, Fireworks AI, Cerebras, ElevenLabs, and Modal Labs ([Routines](https://getroutines.ai/transparency/wispr-flow)) **[Third-party]**. Groq appears in no source.
 
 ---
 
-## 4. Latency
+## 4. How Flow achieves low latency
 
 ### Published numbers
 
 | Metric | Value | Source | Label |
 |---|---|---|---|
-| End of speech → formatted text | < 700 ms | [Wispr](https://wisprflow.ai/post/technical-challenges) | Confirmed |
-| Budget split | ASR < 200 ms, LLM < 200 ms, network < 200 ms "from anywhere… with spotty internet" | [Wispr](https://wisprflow.ai/post/technical-challenges) | Confirmed |
-| Percentile | p99 (per-user p90/p99 tracked) | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/) | Confirmed |
-| LLM throughput requirement | 100+ tokens processed and generated in < 250 ms | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/); Garg on [SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/) ("50 or 100 words within 250 ms") | Confirmed |
-| LLM infra target in hiring | "<500 ms LLM inference for millions of requests from everywhere" | [Ashby](https://jobs.ashbyhq.com/wispr-flow/9cf022b6-55b1-4fcc-940a-6988bd94b6d3) | Confirmed |
-| Improvements | Android launch with an "infrastructure rewrite" 30% faster (Feb 2026); median latency −14% (Oct 2026) | [press](https://steamdeveloper.pages.dev/2026/02/23/wispr-flow-launches-an-android-app-for-ai-powered-dictation/); [Wispr on X](https://x.com/WisprFlow/status/2110085776369471596) | Confirmed / Third-party |
-| Observed by reviewers | ~0.5–2 s; competitor Willow claims Flow at 400–900 ms | [Spokenly](https://spokenly.app/blog/wispr-flow-review); [Willow](https://willowvoice.com/blog/wispr-flow-whisper-flow-willow-comparison) | Third-party (competitor) |
-| Speed marketing | ~220 wpm vs 45 typing ("4×") | [Chatgate summary](https://chatgate.ai/post/wispr-flow) | Marketing |
+| End of speech to formatted text | within 700 ms | [Wispr](https://wisprflow.ai/post/technical-challenges) (2025-09-11) | Confirmed |
+| Budget split | ASR <200 ms, LLM <200 ms, network <200 ms "from anywhere around the world" | [Wispr](https://wisprflow.ai/post/technical-challenges) | Confirmed |
+| Percentile | p99; "we don't care at all about p50" | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/) | Confirmed |
+| LLM step | 100+ tokens processed and generated in <250 ms | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/); Garg on [SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/) ("50 words or a hundred words ... 250 milliseconds") | Confirmed |
+| Hiring target | "<500ms LLM inference for millions of requests from everywhere around the world" | [Built In listing](https://builtin.com/job/ml-engineer/7257184) | Confirmed |
+| Trend | "Dictation latency is down 30% since the start of the year" (2026-07-09) | [What's new](https://wisprflow.ai/whats-new) | Confirmed |
+| Scale | about 1B words dictated per month (Sept 2025); 99.99% uptime target | [Wispr](https://wisprflow.ai/post/technical-challenges) | Confirmed |
 
-### How the pipeline hides latency (from the protocol)
+### Techniques Wispr has named
 
-The reverse-engineered client opens a **bidirectional gRPC stream** to a Baseten endpoint. It sends messages in this order ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**:
+- **Speculative decoding on copy-heavy output.** Garg described guessing that unchanged words will repeat and verifying the guess, which cut LLM latency "by over half in a lot of our cases" ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**. Cleanup output is nearly the same as the input, so drafting from the input transcript (prompt-lookup style) accepts long runs of tokens **[Strongly implied]**.
+- **Budget reallocation.** The team measures each hop and moves budget between steps; saving network time can pay for a larger LLM. Smaller or quantized models lost accuracy ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**. Wispr keeps deploying larger models within the same budget because user edits cost more time than inference ([Technical challenges](https://wisprflow.ai/post/technical-challenges)) **[Confirmed]**.
+- **Co-location.** An incident with one GPU in California and another in the Midwest added 300 to 400 ms; the fix put both in one region ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**.
+- **Serving stack.** TensorRT-LLM engines, Chains for the multi-step pipeline, dedicated autoscaling deployments on AWS workload planes in regions near users ([Baseten](https://www.baseten.co/resources/customers/wispr-flow/)) **[Confirmed]**.
+- **Tail latency.** p99 problems usually come from the network, so Wispr times every hop ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)) **[Confirmed]**.
 
-1. `InitRequest` (user, preferences, vocabulary, style), then `Commit(NON_FINAL)`.
-2. `ContextRequest` (app, textbox, screen, dynamic vocabulary), then `Commit(NON_FINAL)`.
-3. **Audio packets streamed while the user speaks**, each with `Commit(NON_FINAL)`.
-4. The last packet, with `Commit(FINAL)`, which corresponds to key release.
+### What overlaps with speech and what runs after release
 
-The server streams back frames with the latest `raw_text` and `formatted_text`, plus heartbeats. Two more details: a `GET api.wisprflow.ai/warmup` is sent before the stream to avoid cold starts, and the client retries once after 500 ms on UNAVAILABLE or DEADLINE_EXCEEDED. Another static analysis describes the transport as gRPC first, with WebSocket and HTTPS fallbacks, and mentions Modal-hosted endpoints ([shepetal PR #6](https://github.com/backant-io/shepetal/pull/6)) **[Third-party]**.
+From the SDK ([TECHNICAL_DETAILS](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md); [`_core.py`](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/src/wisprflow_sdk/_core.py)) **[Strongly implied]**:
 
-What follows from this design:
+1. `GET api.wisprflow.ai/warmup` before the stream.
+2. One bidirectional gRPC call to `model-<id>.grpc.api.baseten.co`, method `flow_api.v1.TranscriptionService/TranscribeStream`, with both a Wispr bearer token and a Baseten API key in headers.
+3. `InitRequest` (profile, languages, vocabulary, styles), then `Commit(NON_FINAL)`.
+4. `ContextRequest` (app, textbox, screen, dynamic vocabulary), then `Commit(NON_FINAL)`.
+5. Audio packets (16 kHz mono PCM16 in the SDK) with no commit attached, streamed as they are captured.
+6. The last packet carries `Commit(FINAL)`, which corresponds to key release.
+7. The server streams back `State` frames (raw and formatted text), `Result` frames, and heartbeats. One retry after 500 ms on UNAVAILABLE, DEADLINE_EXCEEDED, or RESOURCE_EXHAUSTED.
 
-- **Context and preferences arrive before the audio ends**, so prompt assembly, retrieval, and prefill of the stable part of the LLM prompt can happen before release **[Speculation on prefill reuse]**.
-- **Audio upload and probably incremental ASR overlap with speech.** At release, only the tail of the audio still needs decoding. That makes "<200 ms ASR after end of speech" achievable for long dictations **[Strongly implied]**.
-- **The LLM runs after FINAL on the whole utterance.** The 700 ms budget is measured from the end of speech. "Generate 100+ tokens in <250 ms" describes rewriting a full paragraph at once, not incremental tokens **[Strongly implied]**.
-- **Insertion is one-shot after release.** On the desktop, a Swift helper pastes via the clipboard or injects text ([BoringNotch issue](https://github.com/lionel509/boring.notch/issues/3); [shepetal PR #6](https://github.com/backant-io/shepetal/pull/6)). An Android reviewer saw no live transcript, just text "within a second" of tapping done ([Beebom](https://beebom.com/wispr-flow-ai-dictation-app-transcribes-voice-faster-than-typing)) **[Third-party]**.
-- **On-device components** are the client shell, key hooks, the accessibility-tree walk, possibly OCR, audio encoding (OPUS), and local replacements and snippets. The SDK also applies replacements locally after the gRPC result. **No on-device ASR or LLM**: Flow does not work offline ([SpeakOFlow](https://www.speakoflow.com/blog/does-wispr-flow-work-offline)) **[Third-party, consistent with protocol]**.
-- **Inference providers:** Baseten (TensorRT-LLM, Chains, multi-region) is the confirmed primary. Cerebras, Fireworks, OpenAI, and Anthropic appear as subprocessors and may serve fast or fallback LLM paths **[Third-party / Speculation]**. The September 2024 launch release credits an "ultra-fast inference engine" with no detail ([BusinessWire](https://www.businesswire.com/news/home/20240930079034/en)).
+The real client may encode Opus instead of WAV/PCM; logs show an Opus encoder, behind a feature flag ([Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation); [BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**. The v1.6.1174 analysis also reports a 4 s heartbeat watchdog (2 s after commit), a parallel HTTP fallback that races gRPC for clips under 30 s, a backend fallback to OpenAI transcription, a Modal candidate host, a one-hour probation for failed hosts, and no on-device model or VAD ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**. Wensen Wu saw an HTTP fallback at `chain-o232k03l.api.baseten.co`, which is a Baseten Chains URL **[Third-party]**.
+
+What follows **[Strongly implied unless marked]**:
+
+- Connection setup, auth, preferences, and context all land before the user finishes speaking, so none of it is on the post-release critical path.
+- Audio upload overlaps speech, and the server can run ASR incrementally, so at release only the audio tail is left to decode. That is how <200 ms ASR after end of speech works for long dictations.
+- The LLM pass on the full utterance runs after FINAL, because Backtrack needs right-hand context. The 250 ms budget for 100+ tokens describes rewriting a paragraph at once **[Strongly implied]**. The "previous chunks" detail in the v1.6.1174 analysis suggests that long dictations are formatted in chunks, with each chunk conditioned on earlier raw and LLM output **[Third-party / Speculation on mechanism]**.
+- Insertion is one paste after release. Wispr's IDE doc confirms paste (Shift+Insert on Windows in IDEs), and Command Mode output is "pasted back" **[Confirmed]**.
+- Nothing runs offline. There is no local ASR or LLM ([Enterprise privacy](https://wisprflow.ai/post/enterprise-privacy-and-security-overview)) **[Confirmed]**.
 
 ---
 
-## 5. Can cleanup run while streaming?
+## 5. Can cleanup run in real time, while streaming?
 
-### What Flow does
+### What Wispr does
 
-Flow streams **audio** and probably **ASR**, but it commits **cleaned text only once, after release** **[Strongly implied]**. The protocol can return provisional `formatted_text` frames before FINAL, and the SDK exposes them as partial callbacks. Whether the server actually runs the LLM speculatively on partial audio is not documented **[Unknown]**. Flow's product choice avoids the hard problem: it never has to retract text it has already inserted into someone else's text field, where undo and rewrite are fragile across apps.
+- **Dictation.** Text is inserted once, after release **[Strongly implied]**. I found no Wispr doc, changelog entry, or review describing cleaned text shown live during dictation; the docs describe pasting after you finish and offering "Undo AI edit" afterwards **[Strongly implied from absence]**. The protocol can return partial `formatted_text` frames, and the SDK queues them, but the SDK's own callback only fires after `finish()` and nothing shows Flow displaying partials ([`_core.py`](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/src/wisprflow_sdk/_core.py)) **[Strongly implied]**.
+- **Server-side chunking.** The "previous chunks' raw and LLM text for continuity" finding means the server likely formats long dictations piecewise, which would be incremental cleanup hidden from the user ([BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**.
+- **Notetaker.** It shows a live transcript during meetings and "re-processes the full recording" at the end ([What's new](https://wisprflow.ai/whats-new), 2026-08-05) **[Confirmed]**. That is a two-pass design: provisional live text, then an authoritative full pass.
+- **Why Flow avoids it.** Retracting text already pasted into another app's text field is fragile. Holding everything until release sidesteps the problem, at the cost of needing a very fast full-utterance LLM pass **[Speculation]**.
 
 ### What competitors do
 
-- **Aqua Voice** has two modes ([aquavoice.com/llms.txt](https://aquavoice.com/llms.txt)) **[Confirmed]**:
-  - "Instant Mode: text appears ~450 ms after you stop speaking."
-  - "Streaming Mode: words appear in real time as you talk", which Aqua says gives "maximum contextual understanding and precise control over text and formatting".
+- **Aqua Voice** ([aquavoice.com/llms.txt](https://aquavoice.com/llms.txt)) **[Confirmed by Aqua]**:
+  - Instant Mode (default) shows text "~450ms after you stop speaking", runs on Aqua's own Avalon models, and formats to match the app.
+  - Realtime Mode (formerly Streaming Mode, renamed July 2026) shows words live in the Aqua toolbar, but text lands in the target app when you finish. It "streams audio to a third-party realtime speech provider".
+  - Deep Context takes one screenshot at the start of each dictation (opt-in) and extracts words likely to be misheard.
+  - In the 2024 Launch HN, the founders said Aqua is "6 models working together", that "the real-time text is non-final tokens", and that a restarted sentence keeps only its last version ([Launch HN](https://news.ycombinator.com/item?id=39828686)) **[Confirmed by founders, 2024]**. Aqua shows live text only in its own surface, which is what makes revision safe.
+- **Google Gemini 3.5 Transcribe and Gboard Rambler.** The Live API emits `interim_input_transcription`, a "speculative partial hypothesis", and `input_transcription` when a segment finalizes at a pause or turn end. In SMART mode the final field contains "the cleaned, formatted response", with disfluencies removed and spoken corrections resolved ([Gemini Live transcription docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe?hl=en); [Google blog](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-5-transcribe/), 2026-08-26) **[Confirmed]**. The docs do not say whether interim text is cleaned. This is segment-level streaming cleanup: commit at each pause, revise nothing already final. Rambler on Gboard uses the model ([Google blog](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-5-transcribe/)) **[Confirmed]**. Whether Rambler cleans live or after transcription is described inconsistently in coverage ([Gadget Hacks](https://android.gadgethacks.com/news/gboard-rambler-voice-typing-upgrade-explained-new-vs-existing-features/); [TechCrunch](https://techcrunch.com/2026/05/12/google-adds-gemini-powered-dictation-to-gboard-which-could-be-bad-news-for-dictation-startups/)) **[Third-party]**.
+- **AssemblyAI Dictation API** ([docs](https://www.assemblyai.com/docs/dictation.md); [architecture guide](https://www.assemblyai.com/use-cases/dictation-app-architecture)) **[Confirmed]**:
+  - `POST dictation.assemblyai.com/v1/transcribe/live` reads the multipart body as it arrives, so audio uploads during speech; the config part must come first.
+  - Transcription (Universal-3.5 Pro) and an LLM rewrite run in one call. The response has the verbatim `text` and the rewritten `llm_response`.
+  - The rewrite is one-shot after audio ends, with a best-effort deadline; on timeout it returns `llm_error: "timeout"` with the transcript intact.
+  - Inputs: `stt_prompt` (up to 6,000 characters), `keyterms_prompt` (up to 100 terms), `llm_instruction` (replaces the default cleanup), and `rewrite_mode` fast or smart.
+  - AssemblyAI's own guide frames the choice as "does text appear during the utterance, or after key release?" and recommends streaming for the former.
+- **Blurt**, AssemblyAI's open-source macOS app, makes one HTTP request per utterance to the live endpoint, pre-warms the connection on key press, sends recent session dictations (capped near 4,096 characters), text before the cursor, key terms, and style instructions, and pastes via a synthesized Cmd+V. Its README says audio is read back from disk at release rather than streamed ([GitHub](https://github.com/assemblyai/blurt)) **[Confirmed]**. So Blurt is Flow's design minus streaming upload and minus screen context.
+- **Superwhisper** runs ASR (local Parakeet, cloud Nova 3, and others) and then an optional LLM "mode". Plain Voice to Text skips the LLM and is fastest; Super mode reads the app, selected text, and clipboard. No streaming cleanup is documented ([Superwhisper docs](https://superwhisper.com/docs/modes/built-in.md)) **[Confirmed]**.
+- **Open-source clones** (OpenWhispr, Handy, VoiceInk, and similar) follow push-to-talk, batch ASR on release, an optional LLM rewrite, and paste. None implements streaming cleanup ([OpenWhispr](https://openwhispr.com/compare/wisprflow); [Handy](https://github.com/cjpais/Handy); [VoiceInk](https://tryvoiceink.com/docs/contextual-awareness)) **[Third-party; not re-checked in this pass]**.
 
-  Aqua's 2024 Launch HN described a voice-native editor running "six models" together to transcribe, interpret, and rewrite the document live ([Launch HN](https://news.ycombinator.com/item?id=39828686)). Its own ASR model, **Avalon**, is evaluated on getting key terms right (AISpeak), not raw WER ([Aqua: Introducing Avalon](https://aquavoice.com/blog/introducing-avalon)). The client-side "Deep Context" reads on-screen content. Aqua owns its editor surface (or a preview overlay), which is what makes live revision feasible.
-- **Willow Voice** publishes only marketing numbers (about 200 ms average latency, a 95% zero-edit rate) and no architecture ([Willow blog](https://willowvoice.com/blog/automatic-punctuation-dictation)) **[Third-party/vendor]**.
-- **Google Gboard "Rambler"** (Gemini, announced May 2026) removes fillers and self-corrections. In the "3 p.m., actually 2 p.m." example, it outputs only the corrected time. Coverage describes it as processing speech "as it arrives" ([9to5Google](https://9to5google.com/2026/05/12/gemini-intelligence-announcement/); [Gadget Hacks](https://android.gadgethacks.com/news/gboard-rambler-voice-typing-upgrade-explained-new-vs-existing-features/)) **[Third-party]**.
-- **Superwhisper** runs batch ASR (local Whisper, Groq, or Deepgram) and then an optional user-defined LLM "mode". Its plain transcription mode skips the LLM to be fastest ([Superwhisper docs](https://superwhisper.com/docs/modes/built-in.md)).
+### Research and engineering techniques
 
-### Research and prior art
+- **The core difficulty.** A self-correction is a non-local edit. "Send it Tuesday, no, Wednesday" rewrites a word about a second back, and "scratch that" can delete a sentence. An incremental cleaner must either wait, revise, or speculate.
+- **Commit and revise, measured as erasure.** Re-translation re-runs a model on each growing prefix. Normalized erasure (NE) counts tokens deleted from the previous output per final token. In Arivazhagan et al. (ICASSP 2020), biased beam search (favoring the previous output) plus masking the last k tokens cut NE from 2.11 to 0.12 with BLEU going from 20.40 to 20.17 ([arXiv 1912.03393](https://arxiv.org/pdf/1912.03393)). A follow-up defines "low-revision" as NE below 0.2, under one revised token per five output tokens, and finds re-translation in that regime matches or beats dedicated streaming systems ([arXiv 2004.03643](https://arxiv.org/pdf/2004.03643)). Both map directly onto a cleanup LLM: bias toward the previously emitted cleaned text, and keep the last k words provisional.
+- **LocalAgreement.** Whisper-Streaming commits only the prefix on which consecutive hypotheses agree, with about 3.3 s latency on long-form English ([arXiv 2307.14743](https://arxiv.org/abs/2307.14743)). The same policy works on cleaned output: commit the cleaned prefix that two successive cleanup runs agree on.
+- **Disfluency detection with learned lookahead.** "Teaching BERT to Wait" (NAACL 2022) trains a streaming tagger that decides per token whether to label now or wait for more words, giving comparable accuracy to non-streaming models with lower flicker and lower latency than fixed-lookahead baselines ([arXiv 2205.00620](https://arxiv.org/abs/2205.00620)). A joint streaming ASR plus disfluency model beats a BERT cascade on accuracy and latency ([arXiv 2211.08726](https://arxiv.org/abs/2211.08726)).
+- **LLM disfluency removal.** The DRES benchmark found that segmenting input helps even long-context models, that reasoning models over-delete fluent words, and that fine-tuning raises precision at the cost of generalization ([arXiv 2509.20321v1](https://arxiv.org/abs/2509.20321v1)). "Mind the Pause" (ACL 2026) uses a tagger to flag disfluent tokens and guide an LLM rewriter; it is offline, but the tagger-guides-rewriter split suits streaming ([arXiv 2605.12242](https://arxiv.org/abs/2605.12242)).
+- **Speculative cleanup.** Run cleanup on partial transcripts in the background and reuse the result if the final transcript matches. Wispr's copy-through speculative decoding is the per-token version of the same idea ([SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/)).
 
-- **Streaming disfluency detection.** "Teaching BERT to Wait" trains a streaming tagger that decides whether to label a token now or wait for more context. It comes within about 1 F1 of non-streaming models, with less flicker and an average extra wait of about 0.21 tokens ([arXiv 2205.00620](https://arxiv.org/abs/2205.00620)). "Streaming Joint Speech Recognition and Disfluency Detection" does the tagging inside a blockwise streaming ASR model, with lower latency and a smaller model than a cascade ([arXiv 2211.08726](https://arxiv.org/pdf/2211.08726)).
-- **LLM disfluency removal.** The DRES benchmark finds that segmenting transcripts helps, that reasoning models **over-delete** fluent tokens, and that fine-tuning trades generalization for precision ([arXiv 2509.20321](https://arxiv.org/abs/2509.20321v1)). "Mind the Pause" (ACL 2026) puts a disfluency tagger in front of an instruction-tuned LLM rewriter ([arXiv 2605.12242](https://arxiv.org/pdf/2605.12242)). That tagger-guides-rewriter split is a natural fit for streaming.
-- **Commit/revise theory from simultaneous translation.** Re-translation re-runs the model on each growing prefix and measures flicker as **erasure**, the number of tokens deleted from the previous output. Biased beam search toward the previous output and **masking the last k words** trade flicker for latency. Re-translation with normalized erasure below 0.2 matches streaming MT, and zero erasure reduces to wait-k ([arXiv 1912.03393](https://arxiv.org/pdf/1912.03393); [arXiv 2004.03643](https://arxiv.org/pdf/2004.03643)).
-- **LocalAgreement** (used in Whisper-Streaming) commits only the prefix on which two consecutive hypotheses agree ([arXiv 2307.14743](https://arxiv.org/html/2307.14743)). The same policy applies unchanged to an LLM cleanup stage.
+### Recommendation: a streaming cleanup stage on AssemblyAI's stack
 
-### The core difficulty and tradeoffs
+The building blocks exist today **[Confirmed]**:
 
-A self-correction is a **non-local edit**. "Send it Tuesday, no wait, Wednesday" changes a token roughly 1.5 s back, and "scratch that" can delete a whole sentence. An incremental cleaner therefore needs one of three things:
+- **Universal-3.6 Pro Realtime** streaming emits an early partial at about 750 ms, continuous partials about every second, and exactly one formatted end-of-turn transcript per turn. Turns end on terminal punctuation after `min_turn_silence` (default 100 ms) or at `max_turn_silence` (default 1,000 ms). `prompt` and `keyterms_prompt` can be combined and updated mid-stream with `UpdateConfiguration` ([migration guide](https://assemblyai.com/docs/streaming/migration-guides/universal-to-universal-3-5-pro-streaming); [model selection](https://www.assemblyai.com/docs/streaming/universal-3-pro)).
+- **LLM Gateway** hosts `qwen3.5-4b-32k-fast` on AssemblyAI's GPUs with `stream: true`; AssemblyAI reports 612 ms average on full voice rewrites versus 1,138 ms for GPT-4.1 ([AssemblyAI blog](https://www.assemblyai.com/blog/qwen-4b-llm-gateway), 2026-08-26).
+- **Dictation API** does a one-shot transcribe plus rewrite for a final authoritative pass ([docs](https://www.assemblyai.com/docs/dictation.md)).
 
-- **(a) A hold-back window.** Commit cleaned text only up to a stable boundary, such as the end of a clause or a pause over 300 ms, and keep the last N words provisional. This adds a fixed delay and fails on corrections that reach past the window.
-- **(b) Revision of committed text.** Fine in your own UI. Risky inside third-party text fields, and visually distracting, with the same flicker problem as re-translation.
-- **(c) Speculative cleanup plus a final pass.** Clean prefixes continuously in the background, but insert only after release, re-running the LLM over just the unstable tail plus a summary or KV cache of the already-clean prefix. This cuts post-release LLM time without any visible revisions.
+A design built on these, with my estimates marked **[Speculation]**:
 
-My read: Flow's design (one-shot insert after release, a strict 250 ms LLM budget) is the simple, robust end of this spectrum. Its per-utterance cost grows with dictation length, which is why it needs very fast LLM decoding **[Speculation]**.
+1. **Push context early.** At session start, send dictionary terms and on-screen entities as `keyterms_prompt` and a short description as `prompt`, as Flow sends Init and Context before audio. Update them with `UpdateConfiguration` when the focused app changes.
+2. **Use the formatted turn as the unit of commit.** Treat each end-of-turn transcript (or each sentence inside a long turn) as a segment. Keep exactly one segment provisional. When segment i+1 arrives, clean it with the committed cleaned text plus raw segment i as context, and let the model return either "append" or a structured edit (replace or delete within the provisional segment). Commit segment i once segment i+1 does not open with a correction cue.
+3. **Gate long-range corrections with a cheap detector.** A regex or small tagger for cues ("actually", "no wait", "scratch that", "I mean", "never mind") decides whether the new segment may touch earlier text. Most segments are plain appends, so most cleanup calls are short and cheap. A rare "scratch all that" triggers a full re-clean of the turn.
+4. **Speculate on partials.** Every partial (about once a second) can fire a background cleanup of the provisional segment. Cache results by raw text; if the final turn matches the speculated partial, reuse the cleanup and skip a model call.
+5. **Bias toward the previous output.** Pass the prior cleaned version of the provisional segment and instruct the model to change only what the new words require, the LLM analogue of biased beam search. Track normalized erasure on the displayed text and aim for NE below 0.2.
+6. **Show provisional text only in your own surface.** Put live cleaned text in an overlay or your own editor, as Aqua and Notetaker do. Insert into third-party apps only committed segments, or everything at release.
+7. **Release path.** On key release, send `ForceEndpoint` so the last turn finalizes immediately, then clean only the provisional tail. Added post-release work becomes one short segment instead of a paragraph, plausibly 100 to 300 ms on the 4B gateway model versus about 600 ms for a full rewrite **[Speculation, scaled from AssemblyAI's 612 ms figure]**. Optionally run the Dictation API rewrite on the whole utterance afterwards for stored transcripts.
+8. **For the voice agent in this repo,** nobody reads the cleaned text, so flicker costs nothing. The simplest path is to skip a visible cleanup stage, give the agent LLM the formatted turns with an instruction to honor the latest self-correction, and gate tool calls and TTS playback on the confirmed end-of-turn transcript. Add the segment cleaner only where a person sees or stores the text **[Speculation]**.
 
----
-
-## 6. Reverse engineering and open-source clones
-
-### Wispr Flow internals (community findings)
-
-- **Client stack.** On macOS and Windows the client is an **Electron** app (`resources/app.asar`). On macOS it also has a **native Swift helper** that "owns every OS-level signal": the global key listener, text injection, accessibility, and audio. The two talk over stdio IPC. A Reddit roundup summarizes the dictation flow as "Electron app, Swift helper over stdio, clipboard paste" ([shepetal PR #6](https://github.com/backant-io/shepetal/pull/6), static analysis of v1.6.1174; [soravo_electron PR #41](https://github.com/eySRbS4zgHuW3gMFZB2/soravo_electron/pull/41), Windows v1.6.1337; [BoringNotch issue #3](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party, consistent across three independent analyses]**. More than 10 processes run, including separate keyboard-listener and text-injector binaries ([Wensen Wu](https://www.wensenwu.com/thoughts/wispr-flow-investigation)).
-- **Auth.** Supabase JWTs are stored in the app's `session.json` ([wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**.
-- **Transport and protocol.** Covered in Sections 3 and 4: bidirectional gRPC `flow_api.v1.TranscriptionService/TranscribeStream` on Baseten, with Init/Context/Audio messages and NON_FINAL/FINAL commits. The SDK patch hooks a JS function named `getDesiredGrpcModelInfo()`, which suggests the **client picks a model or deployment ID dynamically**, for example per language or A/B arm. REST under `api.wisprflow.ai` handles warmup and command mode ([wisprflow-sdk TECHNICAL_DETAILS.md](https://github.com/ThisisShashwat/wisprflow-sdk)) **[Strongly implied]**.
-- **Gaps.** No public analysis from a traffic-interception proxy (such as mitmproxy) names the LLM behind the Baseten endpoint. The model is server-side and invisible to the client. Pieter Levels noted Flow clones appearing ([levels.io](https://levels.io/wispr-flow-granola-whoop-reverse-engineered)), but that post has no technical detail. I found **no Hacker News thread** with a technical teardown.
-
-### Open-source clones and their common pattern
-
-| Project | Shell | ASR | Cleanup | Context |
-|---|---|---|---|---|
-| [OpenWhispr](https://openwhispr.com/compare/wisprflow) | Electron + React | whisper.cpp, sherpa-onnx (Parakeet), cloud options | llama.cpp local or cloud LLM | — |
-| [Handy](https://github.com/cjpais/Handy) | Tauri (Rust + React) | whisper-rs, Parakeet | none or minimal | — |
-| [VoiceInk](https://tryvoiceink.com/docs/contextual-awareness) | Native Swift | whisper.cpp, Parakeet (FluidAudio), Apple Speech | "AI Enhancement" via a cloud or Ollama LLM | clipboard + screenshot→OCR text |
-| [shepetal](https://github.com/backant-io/shepetal) | macOS, hold-fn | on-device | — | written explicitly for parity with Flow |
-| Murmure, FreeFlow, FluidVoice ([overview](https://openalternative.co/alternatives/wisprflow)) | various | Parakeet or Whisper | optional Ollama | — |
-
-The shared design: **push-to-talk → buffer audio → batch ASR on release → optional LLM rewrite prompt (with app or screen context) → paste via clipboard or synthetic keystrokes**. None of these clones implements streaming cleanup. Flow differs from them in four ways: server-side streaming upload, context sent before the audio ends, fine-tuned and personalized models, and a tightly engineered p99.
-
----
-
-## 7. Applying this to a real-time STT → LLM → TTS voice agent
-
-In a voice agent, the cleaned transcript is consumed by an LLM rather than shown to a person. That changes the tradeoffs: flicker costs nothing (nobody sees it), but **tool calls and side effects must never fire on uncorrected intent**.
-
-### Option A: No explicit cleanup; the agent LLM reads raw streaming text
-- Stream partial or final ASR text straight into the agent LLM, with a system prompt saying to resolve self-repairs ("no wait", "actually") using the latest intent.
-- **Latency added: 0 ms.** Frontier and mid-size LLMs already handle disfluency well. DRES shows the risk is *over-deletion*, not under-deletion.
-- **Use when** the agent model is strong and the transcript is not shown to the user or stored.
-
-### Option B: Incremental cleanup on a stable prefix (LocalAgreement-style)
-- Run a small, fast cleaner (a fine-tuned 1–8B model, or a tagger plus rewriter as in "Mind the Pause") on ASR segments once they **stabilize**: immutable finals, or two-hypothesis agreement at clause boundaries.
-- Hold back the last clause, or about 1–2 s, because corrections usually point back only a few words.
-- At end of turn, only the **tail** still needs cleaning. **Added latency ≈ cleaning one clause (~30–80 ms on fast inference)** instead of a whole paragraph **[Speculation on numbers]**.
-- A rare long-range correction ("scratch all that") triggers a full re-clean of the turn, accepting a one-off latency hit.
-
-### Option C: Speculative end-of-turn plus preemptive generation
-- On an *eager* end-of-turn signal (for example, Deepgram Flux `EagerEndOfTurn` / LiveKit "preemptive generation"), start cleanup **and** the agent LLM speculatively. If the final transcript matches, adopt the result. Otherwise discard and restart ([LiveKit docs](https://docs.livekit.io/reference/agents-js/classes/plugins_agents_plugin_deepgram.STTv2.html); [LiveKit issue](https://github.com/livekit/agents/issues/5536)).
-- **Saves roughly the endpointing wait (200–500 ms)**. The cost is wasted compute on false triggers. Pair it with Option B so the speculative pass is short.
-- Gate **TTS audio playback and tool execution** on confirmation, not just generation. Generating early is cheap. Speaking or acting early is not.
-
-### Option D: Fold cleanup into the agent's first tokens
-- Ask the agent LLM to emit a short `<intent>` (normalized user request) before its reply. TTS starts only on the reply tokens. This removes a network hop (~50–150 ms) and a second prompt prefill, at the cost of a few extra output tokens.
-
-### Option E: Push context into the ASR, the way Flow and Canto do
-- The cheapest accuracy gain is **biasing ASR with dynamic vocabulary**: contact names, product terms, entities from the conversation so far. Most streaming STT APIs offer keyterm or vocabulary prompting (for example, AssemblyAI streaming keyterms; check current docs). Canto's "distractor" training explains why this works best with a curated short list rather than everything in the context.
-- Send **session context at connection start** (Flow sends Init and Context before audio), so nothing context-related lands on the end-of-turn critical path.
-
-### Option F: Keep cleanup off the critical path entirely
-- For transcripts, CRM notes, or display, run Flow-style full-utterance cleanup **asynchronously after the turn**, while the agent responds from the raw text (Option A).
-
-### Latency budget sketch (end of user speech → first TTS audio)
-
-| Stage | Flow-style batch cleanup | Streaming B+C |
+| Stage (end of speech to text) | Flow-style one-shot | Segment-commit streaming |
 |---|---|---|
-| Endpointing | 300–700 ms (silence timeout) | 100–300 ms (eager EOT, speculative) |
-| ASR finalize | ~100–200 ms | ~50–150 ms (streaming, tail only) |
-| Cleanup LLM | 150–250 ms (whole utterance) | 0–80 ms (tail only, or folded into the agent, Option D) |
-| Agent LLM TTFT | 150–400 ms | 150–400 ms (may already be running speculatively) |
-| TTS TTFB | 75–200 ms | 75–200 ms |
-| **Total** | **~0.8–1.75 s** | **~0.4–1.1 s** |
+| Endpoint or release handling | key release, then FINAL | `ForceEndpoint` on release |
+| ASR finalize | tail only (audio already streamed) | tail only |
+| Cleanup | whole utterance (Flow budget 200 to 250 ms) | last segment only |
+| Visible live text | none | provisional segment in own UI |
+| Risk | long dictations grow cleanup time | long-range corrections need a re-clean |
 
-*(Numbers are illustrative engineering estimates, not measurements **[Speculation]**.)*
+---
 
-**Takeaways for a cascade:**
-1. Stream audio and context early, as Flow does.
-2. Clean a stable prefix incrementally with a hold-back window.
-3. Speculate at end of turn, but gate tool calls and TTS playback on the confirmed transcript.
-4. Prefer folding normalization into the agent LLM over adding a separate model hop, unless a person sees the cleaned text.
+## 6. Reverse engineering and community analyses
+
+- **wisprflow-sdk** (ThisisShashwat). Unofficial Python SDK that patches `app.asar` to dump the runtime config written after `getDesiredGrpcModelInfo()`, then speaks the gRPC protocol with hand-encoded protobuf. It reuses the desktop app's Supabase session from `session.json`. It caps sessions at 300 s and 25 MB ([TECHNICAL_DETAILS](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md)) **[Strongly implied]**. The dynamic model lookup suggests the client picks a deployment ID at runtime, for example per language or experiment arm **[Speculation]**.
+- **BoringNotch issue #3** (2026-10-20). A static read of v1.6.1174 by an AI agent ("Sonnet scout"), with H/M/L confidence labels. Findings: Electron app plus a Swift helper that owns OS signals; gRPC with unary `Transcribe` and duplex `TranscribeStream`; Baseten host with a Modal candidate path; HTTP and OpenAI-proxy fallbacks; `updateContext`; candidate beams with alignment scores, SNR, and volume in server state; server-side semantic auto-stop ([issue](https://github.com/lionel509/boring.notch/issues/3)) **[Third-party]**.
+- **Wensen Wu** (April 2026, v1.4.752). Process listing, `strings`, log reading, and SQLite queries, with no traffic interception. Findings: CGEventTap key handling, accessibility walks, Opus encoder logs, endpoints on Baseten, `api.wisprflow.ai`, `api-east.wisprflow.ai`, Supabase, PostHog, Sentry, Segment, and Datadog; unsandboxed app ([write-up](https://www.wensenwu.com/thoughts/wispr-flow-investigation)) **[Third-party]**.
+- **soravo_electron PR #41** (2026-10-30). Confirms Electron and `app.asar` on Windows v1.6.1337 ([PR](https://github.com/eySRbS4zgHuW3gMFZB2/soravo_electron/pull/41)) **[Third-party]**.
+- **Gaps.** I found no published mitmproxy capture that names the LLM behind the Baseten endpoint, no Hacker News teardown thread, and no Wispr conference talk with architecture slides. The model behind the endpoint is invisible to the client.
 
 ---
 
@@ -276,104 +283,105 @@ In a voice agent, the cleaned transcript is consumed by an LLM rather than shown
 
 | Claim | Status | Key source |
 |---|---|---|
-| End-to-end target < 700 ms after end of speech; 200/200/200 ms budget | Confirmed (Wispr) | [Wispr post](https://wisprflow.ai/post/technical-challenges) |
-| p99 target; LLM must do 100+ tokens in < 250 ms | Confirmed (Baseten case study) | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/) |
-| Cleanup LLM = fine-tuned Llama on Baseten (TensorRT-LLM, Chains) | Confirmed (Baseten case study) | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/) |
-| Llama 3.1 + OpenAI proprietary models for editing | Third-party press | [Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html) |
-| OpenAI / Anthropic / Cerebras / Fireworks / Google / ElevenLabs / OpenPipe / Modal as subprocessors | Third-party | [Routines](https://getroutines.ai/transparency/wispr-flow), [Voibe](https://www.getvoibe.com/resources/wisprtype-vs-wispr-flow/) |
-| Canto: in-house, ~2B params, SFT + GRPO, runtime vocab context, default since ~Sept 2026 | Confirmed (Wispr) | [Canto](https://wisprflow.ai/canto) |
-| ASR before Canto | **Unknown**; routed mix is speculation | — |
-| Backtrack removes fillers and clear self-corrections | Confirmed | [Docs](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack) |
-| Context: app category, textbox before/after/selection, on-screen text, names, IDE identifiers | Confirmed | [Docs](https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness) |
-| Protocol carries URL, bundle ID, screenshot field, OCR and AX tokens, style and editing-strength enums | Strongly implied (client code) | [wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk) |
-| Bidirectional gRPC; audio streamed during speech; FINAL commit on release | Strongly implied | [wisprflow-sdk](https://github.com/ThisisShashwat/wisprflow-sdk) |
-| LLM cleanup runs once on the full utterance after release | Strongly implied | budget wording + protocol |
-| Electron + Swift helper; clipboard or injection insertion | Third-party (three analyses agree) | [shepetal](https://github.com/backant-io/shepetal/pull/6), [soravo](https://github.com/eySRbS4zgHuW3gMFZB2/soravo_electron/pull/41) |
-| Screenshots uploaded in 2025; CTO apology | Third-party | [Embertype](https://embertype.com/blog/the-day-wispr-flow-banned-a-user/), [ModelPiper](https://modelpiper.com/blog/wispr-flow-privacy-incident) |
-| Groq used | **No evidence** | — |
-| Streaming (incremental) cleanup shown to the user | **No evidence**; the protocol allows partial formatted frames | — |
-| Specific model sizes, prompts, and routing between Llama and OpenAI/Anthropic | **Not public** | — |
+| <700 ms target after end of speech; 200/200/200 ms budget | Confirmed | [Wispr](https://wisprflow.ai/post/technical-challenges) |
+| p99 target; 100+ tokens in <250 ms; fine-tuned Llama; TensorRT-LLM; Chains | Confirmed | [Baseten](https://www.baseten.co/resources/customers/wispr-flow/) |
+| Speculative decoding cut LLM latency by over half; models self-hosted | Confirmed | [SE Radio 703](https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/) |
+| OpenAI or Anthropic LLMs may generate outputs | Confirmed | [Terms](https://wisprflow.ai/terms) |
+| Canto in-house; SFT plus GRPO; runtime dictionary context; default since 2026-09-17 | Confirmed | [Canto](https://wisprflow.ai/canto), [What's new](https://wisprflow.ai/whats-new) |
+| Canto about 2B parameters | Third-party press | [VKTR](https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/) |
+| Pre-Canto: ensemble with per-language engine selection | Confirmed | [Wispr](https://wisprflow.ai/research/supporting-languages) |
+| Pre-Canto main path self-hosted on Baseten; OpenAI and ElevenLabs fallbacks | Strongly implied / Third-party | SDK, [Routines](https://getroutines.ai/transparency/wispr-flow) |
+| Backtrack, Smart Formatting, Auto Cleanup None/Light/Medium | Confirmed | [Docs](https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack) |
+| Context: app category, cursor text, on-screen text, IDE identifiers, session apps | Confirmed | [Docs](https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness) |
+| Protocol has screenshot, OCR, AX, URL, bundle ID, style and strength enums | Strongly implied | [wisprflow-sdk](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md) |
+| Chat-conversation context, `updateContext`, chunk continuity on server | Third-party (AI-agent static read) | [BoringNotch #3](https://github.com/lionel509/boring.notch/issues/3) |
+| Previous threads used for tone | Third-party press | [Computerworld](https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html) |
+| gRPC to Baseten; Init and Context before audio; single FINAL commit | Strongly implied | [`_core.py`](https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/src/wisprflow_sdk/_core.py) |
+| Paste-based insertion | Confirmed | [IDE doc](https://docs.wisprflow.ai/articles/6434410694-use-flow-with-cursor-vs-code-and-other-ides) |
+| Live cleaned text during dictation | No evidence | |
+| Notetaker live transcript plus full re-process | Confirmed | [What's new](https://wisprflow.ai/whats-new) |
+| 2025 screenshot upload incident and CTO apology | Third-party, weakly sourced | [Embertype](https://embertype.com/blog/the-day-wispr-flow-banned-a-user/) |
+| Groq used | No evidence | |
 
 ---
 
 ## Sources
 
-**Wispr primary**
-- https://wisprflow.ai/post/technical-challenges
-- https://wisprflow.ai/canto
-- https://wisprflow.ai/research/supporting-languages
-- https://wisprflow.ai/whats-new
-- https://wisprflow.ai/privacy-policy
-- https://wisprflow.ai/data-controls
+**Wispr primary (fetched directly)**
+- https://wisprflow.ai/post/technical-challenges (Sahaj Garg, 2025-09-11)
+- https://wisprflow.ai/research/speech-recognition-challenges (Sahaj Garg, 2025-09-17)
+- https://wisprflow.ai/research/supporting-languages (Sahaj Garg, 2026-01-19)
+- https://wisprflow.ai/canto (2026-09-17)
 - https://wisprflow.ai/lab
+- https://wisprflow.ai/whats-new
+- https://wisprflow.ai/privacy-policy (updated 2026-08-19)
+- https://wisprflow.ai/terms (updated 2026-08-19)
+- https://wisprflow.ai/data-controls (updated 2026-08-18)
+- https://wisprflow.ai/post/enterprise-privacy-and-security-overview
 - https://docs.wisprflow.ai/articles/4678293671-feature-context-awareness
 - https://docs.wisprflow.ai/articles/5373093536-how-do-i-use-smart-formatting-and-backtrack
-- https://docs.wisprflow.ai/articles/8858845757-setup-wispr-flow-on-android-android-settings
+- https://docs.wisprflow.ai/articles/4283510616-auto-cleanup-control-how-much-flow-edits-your-dictation-beta
+- https://docs.wisprflow.ai/articles/6568835559-why-wispr-flow-sometimes-removes-or-changes-words-on-android-smart-formatting
+- https://docs.wisprflow.ai/articles/6434410694-use-flow-with-cursor-vs-code-and-other-ides
+- https://docs.wisprflow.ai/articles/4816967992-how-to-use-command-mode (via search summary)
+- https://docs.wisprflow.ai/articles/2368263928-how-to-setup-flow-styles (via search summary)
+- https://docs.wisprflow.ai/articles/3467817258-security-and-compliance-faq
 - https://docs.wisprflow.ai/articles/4497184932-notetaker-privacy-and-security-overview
-- https://x.com/WisprFlow/status/2110085776369471596
-- https://x.com/tankots/status/2100680985423843608
-- https://jobs.ashbyhq.com/wispr-flow/9cf022b6-55b1-4fcc-940a-6988bd94b6d3
-- https://startup.jobs/ml-engineer-wispr-ai-6425827
-- https://www.linkedin.com/in/sahajgarg/
+- https://builtin.com/job/ml-engineer/7257184 (Wispr ML Engineer listing, removed 2026-01-05)
+
+**Not accessible in this pass**
+- https://x.com/tankots/status/2100680985423843608 and https://x.com/WisprFlow/status/2110085776369471596 (HTTP 402)
+- https://docs.wisprflow.ai/articles/5375461355-subprocessors-third-party-security (404)
+- https://trust.wispr.ai/ (subprocessor list under NDA)
+- https://github.com/backant-io/shepetal/pull/6 (404)
 
 **Vendor, press, and interviews**
 - https://www.baseten.co/resources/customers/wispr-flow/
-- https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html
-- https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/
-- https://se-radio.net/2026/04/se-radio-715-sahaj-garg-on-designing-for-ambiguity-in-human-input/
-- https://linearb.io/dev-interrupted/podcast/wispr-keyboard-bottleneck-vibe-coding-sahaj-garg
-- https://techcrunch.com/2025/06/24/wispr-flow-raises-30m-from-menlo-ventures-for-its-ai-powered-dictation-app/
-- https://www.businesswire.com/news/home/20240930079034/en
-- https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/
-- https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/
-- https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/amp/
-- https://steamdeveloper.pages.dev/2026/02/23/wispr-flow-launches-an-android-app-for-ai-powered-dictation/
-- https://releasebot.io/updates/wispr-flow
-- https://benchlm.ai/models/wispr-canto
+- https://se-radio.net/2026/01/se-radio-703-sahaj-garg-on-low-latency-ai/ (2026-01-14)
+- https://se-radio.net/2026/04/se-radio-715-sahaj-garg-on-designing-for-ambiguity-in-human-input/ (summary only)
+- https://linearb.io/dev-interrupted/podcast/wispr-keyboard-bottleneck-vibe-coding-sahaj-garg (2026-02-24)
+- https://www.computerworld.com/article/4107331/wispr-ceo-interview-post-keyboard-office.html (2025-12-31)
+- https://archive.thedeepview.com/p/wispr-flow-preps-voice-ai-s-next-breakthrough (2026-03-21)
+- https://www.vktr.com/ai-platforms/wispr-hits-2b-valuation-launches-canto-voice-model/ (2026-08-17)
+- https://pulse2.com/wispr-raises-280-million-at-2-billion-valuation-as-revenue-grows-150-quarterly-and-voice-ai-push-accelerates/ (2026-08-17)
+- https://www.aixventures.com/fireside-chat-with-tanay-kothari-at-wispr-flow (VC summary, undated)
 
 **Reverse engineering and privacy analyses**
-- https://github.com/ThisisShashwat/wisprflow-sdk (read in full: README, TECHNICAL_DETAILS.md, `_core.py`; last commit 2026-06-09)
-- https://github.com/backant-io/shepetal/pull/6
-- https://github.com/backant-io/shepetal
-- https://github.com/eySRbS4zgHuW3gMFZB2/soravo_electron/pull/41
+- https://github.com/ThisisShashwat/wisprflow-sdk
+- https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/TECHNICAL_DETAILS.md
+- https://raw.githubusercontent.com/ThisisShashwat/wisprflow-sdk/main/src/wisprflow_sdk/_core.py
 - https://github.com/lionel509/boring.notch/issues/3
-- https://github.com/Micaxes/whispr-bro/issues/1
+- https://github.com/eySRbS4zgHuW3gMFZB2/soravo_electron/pull/41
 - https://www.wensenwu.com/thoughts/wispr-flow-investigation
-- https://levels.io/wispr-flow-granola-whoop-reverse-engineered
 - https://getroutines.ai/transparency/wispr-flow
-- https://www.getvoibe.com/resources/is-wispr-flow-safe/
-- https://www.getvoibe.com/resources/wisprtype-vs-wispr-flow/
-- https://www.getvoibe.com/resources/openai-whisper-vs-wispr-flow/
 - https://embertype.com/blog/the-day-wispr-flow-banned-a-user/
 - https://modelpiper.com/blog/wispr-flow-privacy-incident
-- https://kintal.co/thinking/what-wispr-flow-actually-does
-- https://www.speakoflow.com/blog/does-wispr-flow-work-offline
-- https://www.forasoft.com/learn/ai-for-video-engineering/articles-ai/whisper-flow-app-engineering-walkthrough
-- https://spokenly.app/blog/wispr-flow-review
-- https://beebom.com/wispr-flow-ai-dictation-app-transcribes-voice-faster-than-typing
-- https://chatgate.ai/post/wispr-flow
 
 **Competitors and clones**
-- https://aquavoice.com/blog/introducing-avalon
 - https://aquavoice.com/llms.txt
 - https://news.ycombinator.com/item?id=39828686
-- https://willowvoice.com/blog/automatic-punctuation-dictation
-- https://willowvoice.com/blog/wispr-flow-whisper-flow-willow-comparison
-- https://superwhisper.com/docs/modes/built-in.md
-- https://9to5google.com/2026/05/12/gemini-intelligence-announcement/
+- https://ai.google.dev/gemini-api/docs/live-api/live-transcribe?hl=en
+- https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-5-transcribe/
 - https://android.gadgethacks.com/news/gboard-rambler-voice-typing-upgrade-explained-new-vs-existing-features/
+- https://techcrunch.com/2026/05/12/google-adds-gemini-powered-dictation-to-gboard-which-could-be-bad-news-for-dictation-startups/
+- https://superwhisper.com/docs/modes/built-in.md
 - https://openwhispr.com/compare/wisprflow
 - https://github.com/cjpais/Handy
 - https://tryvoiceink.com/docs/contextual-awareness
-- https://openalternative.co/alternatives/wisprflow
 
-**Research and voice-agent infrastructure**
-- https://arxiv.org/abs/2205.00620 (Teaching BERT to Wait)
-- https://arxiv.org/pdf/2211.08726 (Streaming joint ASR + disfluency detection)
+**AssemblyAI**
+- https://www.assemblyai.com/docs/dictation.md
+- https://www.assemblyai.com/use-cases/dictation-app-architecture
+- https://github.com/assemblyai/blurt
+- https://www.assemblyai.com/blog/qwen-4b-llm-gateway
+- https://www.assemblyai.com/docs/streaming/universal-3-pro
+- https://assemblyai.com/docs/streaming/migration-guides/universal-to-universal-3-5-pro-streaming
+
+**Research**
+- https://arxiv.org/pdf/1912.03393 (Re-translation strategies, ICASSP 2020)
+- https://arxiv.org/pdf/2004.03643 (Re-translation versus streaming, IWSLT 2020)
+- https://arxiv.org/abs/2307.14743 (Whisper-Streaming, LocalAgreement)
+- https://arxiv.org/abs/2205.00620 (Teaching BERT to Wait, NAACL 2022)
+- https://arxiv.org/abs/2211.08726 (Streaming joint ASR and disfluency detection, ICASSP 2023)
 - https://arxiv.org/abs/2509.20321v1 (DRES)
-- https://arxiv.org/pdf/2605.12242 (Mind the Pause)
-- https://arxiv.org/pdf/1912.03393 (Re-translation strategies)
-- https://arxiv.org/pdf/2004.03643 (Re-translation vs streaming)
-- https://arxiv.org/html/2307.14743 (Whisper-Streaming / LocalAgreement)
-- https://docs.livekit.io/reference/agents-js/classes/plugins_agents_plugin_deepgram.STTv2.html
-- https://github.com/livekit/agents/issues/5536
+- https://arxiv.org/abs/2605.12242 (Mind the Pause, ACL 2026)
