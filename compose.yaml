@@ -1,0 +1,11 @@
+services:
+  agent:
+    build: .
+    image: notes-voice-agent
+    env_file: .env.local
+    environment:
+      WORKSPACE_ROOT: /workspace
+    volumes:
+      # Any folder of Markdown or text files. Override with WORKSPACE_DIR=/path docker compose up
+      - ${WORKSPACE_DIR:-./sample-workspace}:/workspace
+    restart: unless-stopped
