@@ -29,7 +29,7 @@ Put your keys in `.env.local` (see `.env.example`). Everything runs in Docker, s
 docker compose up --build
 ```
 
-That starts the agent against LiveKit Cloud, with `./sample-workspace` mounted at `/workspace`. Talk to it from LiveKit Cloud's Agent Console (project > Agents > Console, agent name `assistant`), or from any LiveKit frontend or phone number that dispatches the agent named `assistant`.
+That starts the agent against LiveKit Cloud, with `./sample-workspace` mounted at `/workspace`. It registers as `assistant-local` (the cloud deployment is `assistant`). Talk to it from LiveKit Cloud's Agent Console (project > Agents > Console, pick `assistant-local`), or from any LiveKit frontend or phone number that dispatches that agent name.
 
 To work on a different folder of notes, set `WORKSPACE_DIR` for compose:
 
@@ -46,6 +46,7 @@ All through environment variables, so the same image works anywhere:
 | Variable | Default | What it does |
 |---|---|---|
 | `WORKSPACE_ROOT` | `/workspace` in the container, `./sample-workspace` locally | The folder of notes |
+| `AGENT_NAME` | `assistant` (`assistant-local` under compose) | The name LiveKit dispatches the worker by |
 | `TTS_VOICE_ID` | Audrey | A voice id from the dashboard's voice library, or a cloned voice's id |
 | `ASSISTANT_NAME` | `Audrey` | The name the agent answers to |
 | `LLM_MODEL` | `gemma-4-31b` | Any tool-capable model on the LLM Gateway. The plan is `claude-sonnet-5-5`; see below |

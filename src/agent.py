@@ -46,7 +46,7 @@ load_dotenv(Path(__file__).parents[1] / ".env.local")
 logger = logging.getLogger("agent")
 
 # Frontends, phone numbers and the Agent Console ask LiveKit for the agent by this name
-AGENT_NAME = "assistant"
+AGENT_NAME = os.getenv("AGENT_NAME", "assistant")
 
 # --- Settings, all overridable from the environment ---
 
